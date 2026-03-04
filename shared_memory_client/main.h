@@ -3,12 +3,23 @@
 #include<stdio.h>
 #include <thread>
 //#include<iostream>
+#include <cstring>
 #pragma message("__sizeof(void*) = " _CRT_STRINGIZE(sizeof(void*)))
 #pragma message("__sizeof(PVOID) = " _CRT_STRINGIZE(sizeof(PVOID)))
 HANDLE h_write;
 HANDLE h_read;
 HANDLE hClientEvent = NULL;
 HANDLE hDriverEvent = NULL;
+
+// ═══════════════════════════════════════════════════════════════
+//  WRITE CHANNEL — dedicated path so writes never block reads
+// ═══════════════════════════════════════════════════════════════
+static HANDLE hWClientEvent = NULL;   // UM signals this for write requests
+static HANDLE hWDriverEvent = NULL;   // KM signals this when write done
+static HANDLE hWSection = NULL;
+static LPVOID pWWriteView = NULL;     // mapped write view
+static LPVOID pWReadView = NULL;      // mapped read view (for magic check)
+static bool   g_writeChannelOK = false;
 
 SIZE_T DestSize = 4096;
 UM_Msg* ToDriver = new UM_Msg();
@@ -44,8 +55,17 @@ void clean()
 		delete ToDriver;
 	}
 
+	// ── Write channel cleanup ──
+	if (pWWriteView) { UnmapViewOfFile(pWWriteView); pWWriteView = NULL; }
+	if (pWReadView) { UnmapViewOfFile(pWReadView);  pWReadView = NULL; }
+	if (hWSection) { CloseHandle(hWSection);   hWSection = NULL; }
+	if (hWClientEvent) { CloseHandle(hWClientEvent); hWClientEvent = NULL; }
+	if (hWDriverEvent) { CloseHandle(hWDriverEvent); hWDriverEvent = NULL; }
+	g_writeChannelOK = false;
+
 	printf("[+] Cleaned : %d\n", GetLastError());
 }
+
 
 UM_Msg* InitMsg(UM_Msg* msg, SIZE_T size)
 {
@@ -94,6 +114,47 @@ bool OpenNamedEvents()
 	}
 	return true;
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  WRITE CHANNEL — Open second shared section + events
+//  Call after OpenSharedMemory() + OpenNamedEvents()
+//  Non-fatal: falls back to single-channel if driver doesn't
+//  have write channel (older driver version)
+// ═══════════════════════════════════════════════════════════════
+bool OpenWriteChannel()
+{
+	hWSection = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "Global\\UM_WShared");
+	if (!hWSection) {
+		printf("[WRITE] Section not found — single-channel mode\n");
+		return false;
+	}
+	pWWriteView = MapViewOfFile(hWSection, FILE_MAP_WRITE, 0, 0, DestSize);
+	pWReadView = MapViewOfFile(hWSection, FILE_MAP_READ, 0, 0, DestSize);
+	if (!pWWriteView || !pWReadView) {
+		printf("[WRITE] MapViewOfFile failed\n");
+		if (pWWriteView) { UnmapViewOfFile(pWWriteView); pWWriteView = NULL; }
+		if (pWReadView) { UnmapViewOfFile(pWReadView);  pWReadView = NULL; }
+		CloseHandle(hWSection); hWSection = NULL;
+		return false;
+	}
+
+	hWClientEvent = OpenEventA(EVENT_ALL_ACCESS, FALSE, "Global\\WUM");
+	hWDriverEvent = OpenEventA(EVENT_ALL_ACCESS, FALSE, "Global\\WKM");
+	if (!hWClientEvent || !hWDriverEvent) {
+		printf("[WRITE] Events not found — single-channel mode\n");
+		if (pWWriteView) { UnmapViewOfFile(pWWriteView); pWWriteView = NULL; }
+		if (pWReadView) { UnmapViewOfFile(pWReadView);  pWReadView = NULL; }
+		if (hWSection) { CloseHandle(hWSection); hWSection = NULL; }
+		if (hWClientEvent) { CloseHandle(hWClientEvent); hWClientEvent = NULL; }
+		if (hWDriverEvent) { CloseHandle(hWDriverEvent); hWDriverEvent = NULL; }
+		return false;
+	}
+
+	g_writeChannelOK = true;
+	printf("[+] Dual-channel write ready\n");
+	return true;
+}
+
 
 bool write_address(PVOID addr, const void* data, SIZE_T dataSize, int procId)
 {
@@ -279,7 +340,7 @@ VOID* read_address(PVOID addr, SIZE_T InSize, int procId)
 void ExitSystemThread()
 {
 	SetLastError(0);
-	auto cunt = InitMsg(ToDriver,0);
+	auto cunt = InitMsg(ToDriver, 0);
 	cunt->opType = OPERATION_TYPE::OP_EXIT;
 
 	auto ViewBase = (UM_Msg*)MapViewOfFile(h_write, FILE_MAP_WRITE, 0, 0, DestSize);
@@ -316,14 +377,14 @@ void ExitSystemThread()
 
 uintptr_t GetBaseAddr(const std::string& ProcName)
 {
-	 process_id = get_process_id(ProcName);
+	process_id = get_process_id(ProcName);
 	if (!process_id)
 	{
 		printf("[-] failed to get process id : %X\n", GetLastError());
 		return NULL;
 	}
 
-	auto pussy = InitMsg(ToDriver,0);
+	auto pussy = InitMsg(ToDriver, 0);
 	pussy->ProcId = process_id;
 	pussy->opType = OPERATION_TYPE::OP_BASE;
 
@@ -427,7 +488,7 @@ uintptr_t AllocateMemory(int PID, unsigned char* shellcode, size_t shellcodeSize
 	auto result = WaitForSingleObject(hDriverEvent, INFINITE);
 	if (result == WAIT_OBJECT_0 && read_view->magic == MAGIC)
 	{
-		return static_cast<uintptr_t>(read_view->address); 
+		return static_cast<uintptr_t>(read_view->address);
 	}
 	else
 	{
@@ -705,7 +766,7 @@ T read(const uintptr_t addr, int procId)
 template <typename T>
 void allocate(unsigned char bytes[], int PID)
 {
-	AllocateMemory(PID, bytes, sizeof(bytes)); 
+	AllocateMemory(PID, bytes, sizeof(bytes));
 }
 
 template <typename T>
@@ -720,6 +781,58 @@ void write_virtual(uintptr_t addr, const T& value, int procId)
 {
 	write_address_virtual(reinterpret_cast<PVOID>(addr), &value, sizeof(T), procId);
 }
-// reduce remapping
 
 
+// ═══════════════════════════════════════════════════════════════
+//  DEDICATED WRITE — goes through write channel, never blocks reads
+//  Falls back to old write<T>() if write channel not available
+// ═══════════════════════════════════════════════════════════════
+
+// Synchronous — waits for driver to finish the write (use for bullet TP)
+template<typename T>
+void write_dedicated(uintptr_t addr, T val, int pid)
+{
+	if (!g_writeChannelOK) {
+		// Fallback: use original read-channel write
+		write<T>(addr, val, pid);
+		return;
+	}
+
+	UM_Msg wmsg = {};
+	wmsg.magic = MAGIC;
+	wmsg.ProcId = pid;
+	wmsg.opType = OP_WRITE;
+	wmsg.address = addr;
+	wmsg.dataSize = sizeof(T);
+	memcpy(wmsg.data, &val, sizeof(T));
+
+	memcpy(pWWriteView, &wmsg, sizeof(wmsg));
+	MemoryBarrier();
+	SetEvent(hWClientEvent);
+	WaitForSingleObject(hWDriverEvent, 200); // 200ms max
+}
+
+// Fire-and-forget — does NOT wait for completion (use for speed hack)
+// Only safe at low frequency (1-2 per frame)
+template<typename T>
+void write_async(uintptr_t addr, T val, int pid)
+{
+	if (!g_writeChannelOK) {
+		// Fallback: use original read-channel write
+		write<T>(addr, val, pid);
+		return;
+	}
+
+	UM_Msg wmsg = {};
+	wmsg.magic = MAGIC;
+	wmsg.ProcId = pid;
+	wmsg.opType = OP_WRITE;
+	wmsg.address = addr;
+	wmsg.dataSize = sizeof(T);
+	memcpy(wmsg.data, &val, sizeof(T));
+
+	memcpy(pWWriteView, &wmsg, sizeof(wmsg));
+	MemoryBarrier();
+	SetEvent(hWClientEvent);
+	// Don't wait — driver processes independently
+}

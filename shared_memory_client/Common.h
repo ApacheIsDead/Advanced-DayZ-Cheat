@@ -31,7 +31,13 @@ struct UM_Msg
     BYTE data[3840];           // WAS 256 — expanded for batch reads (still fits in 4096-byte shared section)
 };
 #pragma pack(pop)
-
+typedef struct _UM_WriteMsg {
+    int  ProcId;
+    int  Operation;        // OP_WRITE or OP_WRITE_VIRTUAL
+    ULONGLONG Address;
+    ULONG     Size;        // bytes to write (max 48)
+    UCHAR     Data[48];    // payload
+} UM_WriteMsg;
 // ── Batch read protocol ──
 // Request layout in data[]:
 //   [0..3]                    = count (uint32_t, max 200)

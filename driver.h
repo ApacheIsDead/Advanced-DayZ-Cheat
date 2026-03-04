@@ -1,7 +1,7 @@
 #pragma once
 extern "C"
 {
-	#include "CreateDriver.h"
+#include "CreateDriver.h"
 }
 #include "shared.h"
 #include "imports.h"
@@ -10,10 +10,24 @@ extern "C"
 #include "Physmem.h"
 
 extern PVOID g_SharedSection;
+
+// ═══════════════════════════════════════════════════════════════
+//  READ CHANNEL (existing)
+// ═══════════════════════════════════════════════════════════════
 HANDLE hClientEvent = NULL;
 HANDLE hDriverEvent = NULL;
 PKEVENT pClientEvent = NULL;
 PKEVENT pDriverEvent = NULL;
+
+// ═══════════════════════════════════════════════════════════════
+//  WRITE CHANNEL (new — dedicated path so writes never block reads)
+// ═══════════════════════════════════════════════════════════════
+HANDLE hWClientEvent = NULL;
+HANDLE hWDriverEvent = NULL;
+PKEVENT pWClientEvent = NULL;
+PKEVENT pWDriverEvent = NULL;
+HANDLE hWSection = NULL;
+PVOID  g_WSharedSection = NULL;
 
 BYTE* data;
 
@@ -305,7 +319,128 @@ PETHREAD FindAlertableThread(PEPROCESS Process)
 	return NULL;
 }
 
-VOID DriverLoop(PVOID StartContext) // 
+
+// ═══════════════════════════════════════════════════════════════
+//  WRITE CHANNEL — Shared memory creation
+//  Creates a second shared section + events so writes never
+//  block the read pipeline. Uses standard UM_Msg layout so UM
+//  side can reuse existing write<T>() patterns.
+// ═══════════════════════════════════════════════════════════════
+
+static NTSTATUS CreateWriteSharedMemory()
+{
+	UNICODE_STRING sectionName;
+	RtlInitUnicodeString(&sectionName, L"\\BaseNamedObjects\\UM_WShared");
+
+	// NULL DACL = allow all access (matches existing read channel security)
+	SECURITY_DESCRIPTOR sd;
+	RtlCreateSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+	RtlSetDaclSecurityDescriptor(&sd, TRUE, NULL, FALSE);
+
+	OBJECT_ATTRIBUTES objAttr;
+	InitializeObjectAttributes(&objAttr, &sectionName, OBJ_CASE_INSENSITIVE, NULL, &sd);
+
+	LARGE_INTEGER maxSize;
+	maxSize.QuadPart = PAGE_SIZE; // 4096 — fits UM_Msg (3876 bytes)
+
+	NTSTATUS status = ZwCreateSection(
+		&hWSection,
+		SECTION_ALL_ACCESS,
+		&objAttr,
+		&maxSize,
+		PAGE_READWRITE,
+		SEC_COMMIT,
+		NULL
+	);
+
+	if (!NT_SUCCESS(status))
+	{
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"[-] Write channel: ZwCreateSection failed 0x%X\n", status));
+		return status;
+	}
+
+	SIZE_T viewSize = 0;
+	status = ZwMapViewOfSection(
+		hWSection,
+		NtCurrentProcess(),
+		&g_WSharedSection,
+		0,
+		PAGE_SIZE,
+		NULL,
+		&viewSize,
+		ViewUnmap,
+		0,
+		PAGE_READWRITE
+	);
+
+	if (!NT_SUCCESS(status))
+	{
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"[-] Write channel: ZwMapViewOfSection failed 0x%X\n", status));
+		ZwClose(hWSection);
+		hWSection = NULL;
+	}
+	else
+	{
+		RtlZeroMemory(g_WSharedSection, PAGE_SIZE);
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"[+] Write channel: shared memory created OK\n"));
+	}
+
+	return status;
+}
+
+static void CleanWriteChannel()
+{
+	if (g_WSharedSection)
+	{
+		ZwUnmapViewOfSection(NtCurrentProcess(), g_WSharedSection);
+		g_WSharedSection = NULL;
+	}
+	if (hWSection)
+	{
+		ZwClose(hWSection);
+		hWSection = NULL;
+	}
+	if (pWDriverEvent)
+	{
+		ObDereferenceObject(pWDriverEvent);
+		pWDriverEvent = NULL;
+	}
+	if (pWClientEvent)
+	{
+		ObDereferenceObject(pWClientEvent);
+		pWClientEvent = NULL;
+	}
+	if (hWClientEvent)
+	{
+		ZwClose(hWClientEvent);
+		hWClientEvent = NULL;
+	}
+	if (hWDriverEvent)
+	{
+		ZwClose(hWDriverEvent);
+		hWDriverEvent = NULL;
+	}
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  DRIVER LOOP — Dual-channel: reads and writes on separate paths
+//
+//  Read channel  (index 0, priority): OP_READ, OP_READ_BATCH, 
+//    OP_BASE, OP_MODULE_BASE, OP_ALLOCATE_MEM, OP_QUEUE_APC,
+//    OP_WRITE, OP_WRITE_VIRTUAL (backward compat), OP_EXIT
+//
+//  Write channel (index 1): OP_WRITE, OP_WRITE_VIRTUAL only
+//    — MmCopyVirtualMemory stalls here, not on read path
+//
+//  KeWaitForMultipleObjects(WaitAny) returns lowest satisfied
+//  index on simultaneous signals → reads always win.
+// ═══════════════════════════════════════════════════════════════
+
+VOID DriverLoop(PVOID StartContext)
 {
 	UNREFERENCED_PARAMETER(StartContext);
 	BeDisableApc(true);
@@ -317,10 +452,14 @@ VOID DriverLoop(PVOID StartContext) //
 		return;
 	}
 
+	// Declared here (before any goto) to avoid E0546
+	bool dualChannel = false;
+
+	// ── Create read channel events (existing) ──
 	do
 	{
 		status = CreateNamedEvent(L"\\BaseNamedObjects\\KM", SynchronizationEvent, FALSE, &hDriverEvent, &pDriverEvent);
-		
+
 		if (!NT_SUCCESS(status))
 		{
 			KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -342,24 +481,150 @@ VOID DriverLoop(PVOID StartContext) //
 
 	} while (false);
 
-
-	while (true)
+	// ── Create write channel (new) ──
+	status = CreateWriteSharedMemory();
+	if (!NT_SUCCESS(status))
 	{
-		
-		status = KeWaitForSingleObject(
-			pClientEvent,          // Pointer to the event object.
-			Executive,       // Wait reason.
-			KernelMode,      // Wait in kernel mode.
-			FALSE,           // Not alertable.
-			NULL             // No timeout; wait indefinitely.
-		);
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"[-] Write channel shared memory failed, continuing single-channel\n"));
+		// Non-fatal: fall back to single-channel mode (writes go through read channel)
+	}
 
+	if (NT_SUCCESS(status))
+	{
+		status = CreateNamedEvent(L"\\BaseNamedObjects\\WKM", SynchronizationEvent, FALSE, &hWDriverEvent, &pWDriverEvent);
 		if (!NT_SUCCESS(status))
 		{
 			KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-				"[-] KeWaitForSingleObject failed!\n"));
-			break;
+				"[-] Write driver event failed, continuing single-channel\n"));
+			CleanWriteChannel();
 		}
+	}
+
+	if (pWDriverEvent) // only if previous step succeeded
+	{
+		status = CreateNamedEvent(L"\\BaseNamedObjects\\WUM", SynchronizationEvent, FALSE, &hWClientEvent, &pWClientEvent);
+		if (!NT_SUCCESS(status))
+		{
+			KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+				"[-] Write client event failed, continuing single-channel\n"));
+			CleanWriteChannel();
+		}
+	}
+
+	if (pWClientEvent)
+	{
+		KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+			"[+] Dual-channel mode: write channel ready\n"));
+	}
+
+	// ── Determine wait mode ──
+	// If write channel is up → dual wait (2 objects)
+	// If write channel failed → single wait (backward compatible)
+	dualChannel = (pWClientEvent != NULL && pWDriverEvent != NULL && g_WSharedSection != NULL);
+
+	while (true)
+	{
+		if (dualChannel)
+		{
+			// ═══════════════════════════════════════════
+			//  DUAL-CHANNEL WAIT
+			//  Index 0 = read channel (priority)
+			//  Index 1 = write channel
+			// ═══════════════════════════════════════════
+			PVOID waitObjects[2];
+			waitObjects[0] = pClientEvent;
+			waitObjects[1] = pWClientEvent;
+
+			status = KeWaitForMultipleObjects(
+				2,               // count
+				waitObjects,     // object array
+				WaitAny,         // wake on EITHER
+				Executive,
+				KernelMode,
+				FALSE,           // not alertable
+				NULL,            // no timeout
+				NULL             // wait block array (NULL ok for count <= 3)
+			);
+
+			// ─── WRITE CHANNEL WOKE ───
+			if (status == STATUS_WAIT_0 + 1)
+			{
+				auto wmsg = (UM_Msg*)g_WSharedSection;
+				if (wmsg && wmsg->magic == MAGIC)
+				{
+					if (wmsg->opType == OPERATION_TYPE::OP_WRITE)
+					{
+						KeMemoryBarrier();
+						if (wmsg->ProcId != 0 && wmsg->data != NULL && wmsg->dataSize != 0)
+						{
+							SIZE_T written = 0;
+							WriteProcessMemory(wmsg->ProcId,
+								reinterpret_cast<PVOID>(wmsg->address),
+								wmsg->data,
+								wmsg->dataSize,
+								&written);
+							// Don't break on failure — writes are non-critical
+						}
+					}
+					else if (wmsg->opType == OPERATION_TYPE::OP_WRITE_VIRTUAL)
+					{
+						KeMemoryBarrier();
+						if (wmsg->ProcId != 0 && wmsg->data != NULL && wmsg->dataSize != 0)
+						{
+							SIZE_T written = 0;
+							WriteProcessMemoryVirtual(wmsg->ProcId,
+								reinterpret_cast<PVOID>(wmsg->address),
+								wmsg->data,
+								wmsg->dataSize,
+								&written);
+						}
+					}
+				}
+				KeSetEvent(pWDriverEvent, IO_NO_INCREMENT, TRUE);
+				continue; // back to wait — don't fall through to read handler
+			}
+
+			// ─── READ CHANNEL WOKE (or error) ───
+			if (status != STATUS_WAIT_0)
+			{
+				// Timeout or unexpected status — just loop
+				if (status == STATUS_TIMEOUT) continue;
+				KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+					"[-] KeWaitForMultipleObjects unexpected status 0x%X\n", status));
+				continue;
+			}
+
+			// Fall through to read channel processing below
+		}
+		else
+		{
+			// ═══════════════════════════════════════════
+			//  SINGLE-CHANNEL WAIT (fallback / backward compat)
+			// ═══════════════════════════════════════════
+			status = KeWaitForSingleObject(
+				pClientEvent,
+				Executive,
+				KernelMode,
+				FALSE,
+				NULL
+			);
+
+			if (!NT_SUCCESS(status))
+			{
+				KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+					"[-] KeWaitForSingleObject failed!\n"));
+				break;
+			}
+
+			// Fall through to read channel processing below
+		}
+
+
+		// ═══════════════════════════════════════════════════════════
+		//  READ CHANNEL PROCESSING
+		//  All existing operations — unchanged from your original code
+		// ═══════════════════════════════════════════════════════════
 
 		ReadSharedMemory();
 
@@ -420,9 +685,9 @@ VOID DriverLoop(PVOID StartContext) //
 				KeMemoryBarrier();
 
 				PEPROCESS proc;
-				status = PsLookupProcessByProcessId(ULongToHandle( msg->ProcId), &proc);
-				
-				if (!NT_SUCCESS(status)) 
+				status = PsLookupProcessByProcessId(ULongToHandle(msg->ProcId), &proc);
+
+				if (!NT_SUCCESS(status))
 				{
 					KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
 						"[-] PsLookupProcessByProcessId failed!\n"));
@@ -450,26 +715,26 @@ VOID DriverLoop(PVOID StartContext) //
 
 			if (msg->magic == MAGIC && msg->opType == OPERATION_TYPE::OP_READ) // read
 			{
-				
+
 				KeMemoryBarrier();
-			
+
 				data = (BYTE*)ExAllocatePoolWithTag(NonPagedPool, msg->dataSize, 'bufT');
 				if (!data)
 				{
 					KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[-] %s Failed to allocate memory\n", __FUNCTION__));
 					break;
 				}
-				
+
 				RtlZeroMemory(data, sizeof(data));
 				SIZE_T read;
-				
+
 
 				status = ReadProcessMemory(msg->ProcId,
 					reinterpret_cast<PVOID>(msg->address),
 					data,
 					msg->dataSize,
 					&read);
-	
+
 				if (!NT_SUCCESS(status))
 				{
 					KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -485,6 +750,10 @@ VOID DriverLoop(PVOID StartContext) //
 				KeSetEvent(pDriverEvent, IO_NO_INCREMENT, TRUE);
 			}
 
+			// ── Backward-compat: writes on read channel still work ──
+			// (UM code using old write<T>() goes here; new write_dedicated<T>() 
+			//  goes through write channel above and never touches this path)
+
 			if (msg->magic == MAGIC && msg->opType == OPERATION_TYPE::OP_WRITE) // write
 			{
 				KeMemoryBarrier();
@@ -497,12 +766,12 @@ VOID DriverLoop(PVOID StartContext) //
 				}
 
 				SIZE_T written = 0;
-				status = WriteProcessMemory(msg->ProcId,         
+				status = WriteProcessMemory(msg->ProcId,
 					reinterpret_cast<PVOID>(msg->address),
-					msg->data,           
-					msg->dataSize,       
+					msg->data,
+					msg->dataSize,
 					&written);
-				
+
 				if (!NT_SUCCESS(status))
 				{
 					KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -627,17 +896,11 @@ VOID DriverLoop(PVOID StartContext) //
 			}
 
 
-			// ══════════════════════════════════════════════════════════════════
-			// ══════════════════════════════════════════════════════════════════
-//  PASTE THIS INTO DriverLoop() in driver.h
-//  BEFORE the OP_EXIT check, AFTER the OP_WRITE_VIRTUAL block
-// ══════════════════════════════════════════════════════════════════
-
+			// ── BATCH READ ──
 			if (msg->magic == MAGIC && msg->opType == OPERATION_TYPE::OP_READ_BATCH)
 			{
 				KeMemoryBarrier();
 
-				// ── Parse request ──
 				// Layout: [count:4][{addr:8, size:4} × count]
 				ULONG count = *(ULONG*)msg->data;
 				if (count > 200) count = 200;
@@ -647,7 +910,7 @@ VOID DriverLoop(PVOID StartContext) //
 				BReq reqs[200];
 				RtlCopyMemory(reqs, msg->data + 4, count * sizeof(BReq));
 
-				// ── Execute all reads, pack results into data[] ──
+				// Execute all reads, pack results into data[]
 				ULONG offset = 0;
 				for (ULONG i = 0; i < count; i++)
 				{
@@ -659,14 +922,13 @@ VOID DriverLoop(PVOID StartContext) //
 					NTSTATUS rs = ReadProcessMemory(
 						msg->ProcId,
 						(PVOID)reqs[i].addr,
-						msg->data + offset,   // write result directly into shared mem
+						msg->data + offset,
 						sz,
 						&bytesRead
 					);
 
 					if (!NT_SUCCESS(rs))
 					{
-						// Zero-fill on failure (usermode sees zeroes, same as bad pointer)
 						RtlZeroMemory(msg->data + offset, sz);
 					}
 
@@ -675,6 +937,7 @@ VOID DriverLoop(PVOID StartContext) //
 
 				KeSetEvent(pDriverEvent, IO_NO_INCREMENT, TRUE);
 			}
+
 			if (msg->magic == MAGIC && msg->opType == OPERATION_TYPE::OP_EXIT) // exit
 			{
 				break;
@@ -685,6 +948,7 @@ VOID DriverLoop(PVOID StartContext) //
 
 cleanUp:
 
+	// ── Clean read channel (existing) ──
 	if (pDriverEvent)
 	{
 		ObDereferenceObject(pDriverEvent);
@@ -701,11 +965,12 @@ cleanUp:
 	{
 		ZwClose(hDriverEvent);
 	}
-	
+
+	// ── Clean write channel (new) ──
+	CleanWriteChannel();
+
 	CleanSharedMemory();
 	BeDisableApc(false);
 	KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
 		"[!] Thread Exited\n"));
 }
-
-
