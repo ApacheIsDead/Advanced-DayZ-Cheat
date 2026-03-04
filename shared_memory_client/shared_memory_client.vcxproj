@@ -170,6 +170,7 @@
     <ClInclude Include="..\..\..\..\Downloads\imgui-master\misc\freetype\imgui_freetype.h" />
     <ClInclude Include="..\..\..\..\Downloads\imgui-master\misc\single_file\imgui_single_file.h" />
     <ClInclude Include="aimbot.h" />
+    <ClInclude Include="d2d_renderer.h" />
     <ClInclude Include="main.h" />
     <ClInclude Include="Common.h" />
     <ClInclude Include="math.h" />
