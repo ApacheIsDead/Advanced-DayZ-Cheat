@@ -48,10 +48,11 @@ static ULONG_PTR g_gdipToken = 0;
 #include <dwmapi.h>
 #pragma comment(lib, "Dwmapi.lib")
 
-// ── Direct2D / DirectWrite overlay renderer (hardware-accelerated ESP) ──
+// ── Direct2D / DirectWrite overlay renderer (hardware-accelerated ESP + Menu) ──
 #include "d2d_renderer.h"
 static D2DOverlay g_espOverlay;                       // ESP overlay D2D instance
-static thread_local D2DOverlay* g_d2d = nullptr;      // per-thread D2D pointer (set during ESP render)
+static D2DOverlay g_menuD2D;                          // Menu D2D instance (DirectX-rendered menu)
+static thread_local D2DOverlay* g_d2d = nullptr;      // per-thread D2D pointer (set during ESP/menu render)
 
 // ═══ DEBUG: Crash handler — keeps console open on crash ═══
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
@@ -1843,21 +1844,21 @@ static inline void EspSelectFont(HDC dc, HFONT hf, IDWriteTextFormat* dwf) {
 }
 static inline void EspTextOut(HDC dc, int x, int y, const char* s, int n) {
     if (g_d2d) g_d2d->Text(s, n, (float)x, (float)y, g_espTextCol, g_espFont);
-    else TextOutA(dc, x, y, s, n);
+    else mText(dc, x, y, s, n);
 }
 static inline void EspTextOutShadow(HDC dc, int x, int y, const char* s, int n) {
     if (g_d2d) g_d2d->TextShadow(s, n, (float)x, (float)y, g_espTextCol, g_espFont);
     else {
         COLORREF prev = g_espTextCol;
-        SetTextColor(dc, RGB(0, 0, 0));
-        TextOutA(dc, x + 1, y + 1, s, n);
-        SetTextColor(dc, prev);
-        TextOutA(dc, x, y, s, n);
+        mSetColor( RGB(0, 0, 0));
+        mText(dc, x + 1, y + 1, s, n);
+        mSetColor( prev);
+        mText(dc, x, y, s, n);
     }
 }
 static inline void EspMeasure(HDC dc, const char* s, int n, SIZE* out) {
     if (g_d2d) g_d2d->TextMeasure(s, n, g_espFont, out);
-    else GetTextExtentPoint32A(dc, s, n, out);
+    else mMeasure(dc, s, n, out);
 }
 
 // ── ESP GDI shape helpers — route to D2D or GDI ──
@@ -3717,50 +3718,57 @@ void StopAll() {
 // ═══════════════════════════════════════════════════════════════
 
 // ── Layout constants ──
-static constexpr int MW = 720;
-static constexpr int MH = 540;
-static constexpr int HDR_H = 48;
-static constexpr int FTR_H = 30;
-static constexpr int SB_W = 58;
+// ═══════════════════════════════════════════════════════════════
+//  MENU LAYOUT — "NEON PULSE" DirectX Redesign
+// ═══════════════════════════════════════════════════════════════
+static constexpr int MW = 800;
+static constexpr int MH = 580;
+static constexpr int HDR_H = 54;
+static constexpr int FTR_H = 28;
+static constexpr int SB_W = 64;
 static constexpr int CONT_L = SB_W;
 static constexpr int CONT_W = MW - SB_W;
 static constexpr int CONT_T = HDR_H;
 static constexpr int CONT_VH = MH - HDR_H - FTR_H; // visible content height
-static constexpr int CPAD = 10;   // content edge padding (tighter)
-static constexpr int CGAP = 8;    // gap between cards (tighter)
+static constexpr int CPAD = 12;    // content edge padding
+static constexpr int CGAP = 10;    // gap between cards
 static constexpr int COLW = (CONT_W - CPAD * 2 - CGAP) / 2;
-static constexpr int CHDR = 40;   // card header height (bigger)
-static constexpr int CPAD_I = 12;   // card internal side padding
-static constexpr int ROW_H = 28;   // toggle row height (slightly taller for readability)
-static constexpr int SLD_H = 42;   // slider total height
-static constexpr int BONE_H = 34;   // bone selector
-static constexpr int SEP_H = 10;   // separator
-static constexpr int LABEL_H = 22;   // label row
-static constexpr int TGL_W = 32;   // small toggle width
-static constexpr int TGL_H = 17;   // small toggle height
-static constexpr int HTGL_W = 38;   // header toggle width
-static constexpr int HTGL_H = 21;   // header toggle height
-static constexpr int CARD_R = 12;   // card corner radius
+static constexpr int CHDR = 42;    // card header height
+static constexpr int CPAD_I = 14;  // card internal side padding
+static constexpr int ROW_H = 30;   // toggle row height
+static constexpr int SLD_H = 44;   // slider total height
+static constexpr int BONE_H = 36;  // bone selector
+static constexpr int SEP_H = 12;   // separator
+static constexpr int LABEL_H = 24; // label row
+static constexpr int TGL_W = 36;   // small toggle width
+static constexpr int TGL_H = 18;   // small toggle height
+static constexpr int HTGL_W = 42;  // header toggle width
+static constexpr int HTGL_H = 22;  // header toggle height
+static constexpr int CARD_R = 14;  // card corner radius
 
-// ── Colors ──
-static const COLORREF C_BG = RGB(18, 18, 22);
-static const COLORREF C_SIDEBAR = RGB(13, 13, 16);
-static const COLORREF C_HDR = RGB(20, 20, 24);
-static const COLORREF C_CARD = RGB(22, 22, 28);
-static const COLORREF C_CARD_HDR = RGB(19, 19, 24);
-static const COLORREF C_BORDER = RGB(32, 34, 38);
-static const COLORREF C_BORDER_A = RGB(42, 46, 52);  // active card border (will be tinted)
-static const COLORREF C_TEXT = RGB(220, 225, 222);
-static const COLORREF C_TEXT_DIM = RGB(108, 118, 112);
-static const COLORREF C_TEXT_VDIM = RGB(55, 62, 58);
-static const COLORREF C_ACCENT = RGB(0, 230, 118);
-static const COLORREF C_GREEN = RGB(0, 230, 118);
-static const COLORREF C_SB_LINE = RGB(28, 30, 32);
-static const COLORREF C_TOGGLE_OFF = RGB(30, 30, 36);
-static const COLORREF C_KNOB_OFF = RGB(68, 72, 70);
-static const COLORREF C_SLD_BG = RGB(24, 24, 28);
-static const COLORREF C_INFO_BG = RGB(16, 16, 20);
-static const COLORREF C_BLUE = RGB(0, 170, 255);   // electric blue secondary accent
+// ═══════════════════════════════════════════════════════════════
+//  COLOR SCHEME — "NEON PULSE" Cyberpunk Palette
+// ═══════════════════════════════════════════════════════════════
+static const COLORREF C_BG = RGB(8, 8, 14);              // deep void background
+static const COLORREF C_SIDEBAR = RGB(6, 6, 10);         // darkest sidebar
+static const COLORREF C_HDR = RGB(12, 12, 20);           // header gradient base
+static const COLORREF C_CARD = RGB(14, 14, 22);          // card surface
+static const COLORREF C_CARD_HDR = RGB(12, 12, 18);      // card header tint
+static const COLORREF C_BORDER = RGB(22, 24, 36);        // subtle dark border
+static const COLORREF C_BORDER_A = RGB(36, 40, 56);      // active card border
+static const COLORREF C_TEXT = RGB(230, 235, 240);        // bright text
+static const COLORREF C_TEXT_DIM = RGB(90, 100, 120);     // muted label text
+static const COLORREF C_TEXT_VDIM = RGB(45, 50, 65);      // very dim hints
+static const COLORREF C_ACCENT = RGB(0, 210, 255);        // primary cyan accent
+static const COLORREF C_GREEN = RGB(0, 255, 136);         // neon green (toggles ON)
+static const COLORREF C_SB_LINE = RGB(18, 20, 30);        // sidebar divider
+static const COLORREF C_TOGGLE_OFF = RGB(22, 22, 32);     // toggle off track
+static const COLORREF C_KNOB_OFF = RGB(60, 64, 75);       // toggle off knob
+static const COLORREF C_SLD_BG = RGB(18, 18, 28);         // slider track bg
+static const COLORREF C_INFO_BG = RGB(10, 10, 18);        // info box bg
+static const COLORREF C_BLUE = RGB(0, 170, 255);          // electric blue
+static const COLORREF C_PURPLE = RGB(160, 60, 255);       // accent purple
+static const COLORREF C_PINK = RGB(255, 40, 120);         // accent pink/magenta
 
 // ── Menu state ──
 static HWND g_menuHwnd = nullptr;
@@ -3792,6 +3800,51 @@ struct LiveSlider {
 static std::vector<LiveSlider> g_liveSliders;
 static int g_sliderDragIdx = -1;
 
+// ═══════════════════════════════════════════════════════════════
+//  D2D MENU TEXT HELPERS — replaces GDI TextOutA/SetTextColor/SelectObject
+//  When g_d2d is set (menu rendering), these route to DirectWrite.
+//  When g_d2d is null (fallback), they use GDI.
+// ═══════════════════════════════════════════════════════════════
+static thread_local COLORREF g_mtc = RGB(230, 235, 240); // menu text color state
+static thread_local IDWriteTextFormat* g_mtf = nullptr;   // current menu DWrite font
+
+static inline void mSetColor(COLORREF c) { g_mtc = c; }
+static inline void mSetFont(IDWriteTextFormat* f) { g_mtf = f; }
+
+// mFont helpers — select font by role
+static inline void mFontNorm() { if (g_d2d) g_mtf = g_menuD2D.fontMenu.Get(); }
+static inline void mFontBold() { if (g_d2d) g_mtf = g_menuD2D.fontMenuBold.Get(); }
+static inline void mFontSmall() { if (g_d2d) g_mtf = g_menuD2D.fontMenuSmall.Get(); }
+static inline void mFontTitle() { if (g_d2d) g_mtf = g_menuD2D.fontMenuTitle.Get(); }
+static inline void mFontSub() { if (g_d2d) g_mtf = g_menuD2D.fontMenuSub.Get(); }
+
+// Text output — routes to D2D or GDI
+static inline void mText(HDC dc, int x, int y, const char* s, int n) {
+    if (g_d2d) { g_d2d->Text(s, n, (float)x, (float)y, g_mtc, g_mtf); return; }
+    SetTextColor(dc, g_mtc); mText(dc, x, y, s, n);
+}
+
+// Text measurement — routes to D2D or GDI
+static inline void mMeasure(HDC dc, const char* s, int n, SIZE* out) {
+    if (g_d2d) { g_d2d->TextMeasure(s, n, g_mtf, out); return; }
+    mMeasure(dc, s, n, out);
+}
+
+// Fill rect helper — routes to D2D or GDI
+static inline void mFillRect(HDC dc, int x, int y, int w, int h, COLORREF c) {
+    if (g_d2d) { g_d2d->FillRect((float)x, (float)y, (float)w, (float)h, c); return; }
+    HBRUSH b = CreateSolidBrush(c); RECT r = { x, y, x + w, y + h }; FillRect(dc, &r, b); DeleteObject(b);
+}
+
+// Rounded rect helper — routes to D2D or GDI
+static inline void mRoundRect(HDC dc, int x, int y, int w, int h, int r, COLORREF fill, COLORREF stroke, int sw = 1) {
+    if (g_d2d || g_gfx) { GdipRoundRect(x, y, w, h, r, fill, stroke, sw); return; }
+    HBRUSH b = CreateSolidBrush(fill); HPEN p = CreatePen(PS_SOLID, sw, stroke);
+    SelectObject(dc, b); SelectObject(dc, p);
+    RoundRect(dc, x, y, x + w, y + h, r * 2, r * 2);
+    DeleteObject(b); DeleteObject(p);
+}
+
 // ── Sidebar nav (icon-only) ──
 struct SBItem { const char* label; int page; };
 static const SBItem g_sbItems[] = {
@@ -3806,14 +3859,29 @@ static constexpr int SB_COUNT = 6;
 static constexpr int SB_ICON_SZ = 38;
 static constexpr int SB_ICON_GAP = 2;
 
-// ── GDI icon drawing ──
+// ── Icon drawing (D2D-first with GDI fallback) ──
 static void DrawIconEye2(HDC dc, int cx, int cy, COLORREF c) {
+    if (g_d2d) {
+        g_d2d->DrawCircle((float)cx, (float)cy, 7.0f, c, 1.2f); // outer eye (wider ellipse approx)
+        g_d2d->EllipseOutline((float)cx, (float)cy, 8.0f, 5.0f, c, 1.2f);
+        g_d2d->FillCircle((float)cx, (float)cy, 2.5f, c);        // pupil
+        return;
+    }
     HPEN p = CreatePen(PS_SOLID, 1, c); SelectObject(dc, p); SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(dc, cx - 7, cy - 4, cx + 7, cy + 4);
     HBRUSH b = CreateSolidBrush(c); SelectObject(dc, b);
     Ellipse(dc, cx - 2, cy - 2, cx + 3, cy + 3); DeleteObject(b); DeleteObject(p);
 }
 static void DrawIconCross2(HDC dc, int cx, int cy, COLORREF c) {
+    if (g_d2d) {
+        g_d2d->DrawCircle((float)cx, (float)cy, 7.0f, c, 1.2f);
+        g_d2d->DrawCircle((float)cx, (float)cy, 3.0f, c, 1.0f);
+        g_d2d->Line((float)cx, (float)(cy - 8), (float)cx, (float)(cy - 3), c, 1.2f);
+        g_d2d->Line((float)cx, (float)(cy + 3), (float)cx, (float)(cy + 8), c, 1.2f);
+        g_d2d->Line((float)(cx - 8), (float)cy, (float)(cx - 3), (float)cy, c, 1.2f);
+        g_d2d->Line((float)(cx + 3), (float)cy, (float)(cx + 8), (float)cy, c, 1.2f);
+        return;
+    }
     HPEN p = CreatePen(PS_SOLID, 1, c); SelectObject(dc, p); SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(dc, cx - 6, cy - 6, cx + 6, cy + 6);
     Ellipse(dc, cx - 3, cy - 3, cx + 3, cy + 3);
@@ -3824,6 +3892,12 @@ static void DrawIconCross2(HDC dc, int cx, int cy, COLORREF c) {
     DeleteObject(p);
 }
 static void DrawIconRadar2(HDC dc, int cx, int cy, COLORREF c) {
+    if (g_d2d) {
+        g_d2d->DrawCircle((float)cx, (float)cy, 7.0f, c, 1.2f);
+        g_d2d->Line((float)cx, (float)cy, (float)(cx + 5), (float)(cy - 5), c, 1.5f);
+        g_d2d->FillCircle((float)cx, (float)cy, 1.5f, c);
+        return;
+    }
     HPEN p = CreatePen(PS_SOLID, 1, c); SelectObject(dc, p); SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(dc, cx - 6, cy - 6, cx + 6, cy + 6);
     Arc(dc, cx - 6, cy - 6, cx + 6, cy + 6, cx, cy - 6, cx + 6, cy);
@@ -3831,6 +3905,12 @@ static void DrawIconRadar2(HDC dc, int cx, int cy, COLORREF c) {
     DeleteObject(p);
 }
 static void DrawIconFilter2(HDC dc, int cx, int cy, COLORREF c) {
+    if (g_d2d) {
+        g_d2d->Line((float)(cx - 6), (float)(cy - 4), (float)(cx + 6), (float)(cy - 4), c, 2.0f);
+        g_d2d->Line((float)(cx - 4), (float)cy, (float)(cx + 4), (float)cy, c, 2.0f);
+        g_d2d->Line((float)(cx - 2), (float)(cy + 4), (float)(cx + 2), (float)(cy + 4), c, 2.0f);
+        return;
+    }
     HPEN p = CreatePen(PS_SOLID, 2, c); SelectObject(dc, p);
     MoveToEx(dc, cx - 5, cy - 4, NULL); LineTo(dc, cx + 5, cy - 4);
     MoveToEx(dc, cx - 3, cy, NULL); LineTo(dc, cx + 3, cy);
@@ -3838,12 +3918,27 @@ static void DrawIconFilter2(HDC dc, int cx, int cy, COLORREF c) {
     DeleteObject(p);
 }
 static void DrawIconGear2(HDC dc, int cx, int cy, COLORREF c) {
+    if (g_d2d) {
+        g_d2d->DrawCircle((float)cx, (float)cy, 3.5f, c, 1.2f);
+        for (int i = 0; i < 8; i++) {
+            float a = i * 0.785398f;
+            g_d2d->Line((float)cx + 4.5f * cosf(a), (float)cy + 4.5f * sinf(a),
+                (float)cx + 7.5f * cosf(a), (float)cy + 7.5f * sinf(a), c, 1.5f);
+        }
+        return;
+    }
     HPEN p = CreatePen(PS_SOLID, 1, c); SelectObject(dc, p); SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(dc, cx - 3, cy - 3, cx + 3, cy + 3);
     for (int i = 0; i < 8; i++) { float a = i * 0.785398f; int ex = cx + (int)(7 * cosf(a)); int ey = cy + (int)(7 * sinf(a)); MoveToEx(dc, cx + (int)(4 * cosf(a)), cy + (int)(4 * sinf(a)), NULL); LineTo(dc, ex, ey); }
     DeleteObject(p);
 }
 static void DrawIconBolt2(HDC dc, int cx, int cy, COLORREF c) {
+    if (g_d2d) {
+        g_d2d->Line((float)(cx + 2), (float)(cy - 8), (float)(cx - 3), (float)(cy + 1), c, 2.2f);
+        g_d2d->Line((float)(cx - 3), (float)(cy + 1), (float)(cx + 2), (float)(cy + 1), c, 2.2f);
+        g_d2d->Line((float)(cx + 2), (float)(cy + 1), (float)(cx - 1), (float)(cy + 8), c, 2.2f);
+        return;
+    }
     HPEN p = CreatePen(PS_SOLID, 2, c); SelectObject(dc, p);
     MoveToEx(dc, cx + 1, cy - 7, NULL); LineTo(dc, cx - 3, cy + 1); LineTo(dc, cx + 1, cy + 1); LineTo(dc, cx - 1, cy + 7);
     DeleteObject(p);
@@ -3884,31 +3979,40 @@ static int CardBegin(HDC dc, int x, int y, int w, int h, const char* title, COLO
     bool on = toggle ? toggle->load() : true;
     COLORREF border = on ? TintBorder(accent) : C_BORDER;
 
-    // ── GDI+ path: antialiased card with optional glow ──
-    if (g_gfx) {
-        if (on && toggle) GdipGlow(x, y, w, h, CARD_R, accent, 8, 20);
+    // ── D2D / GDI+ path: antialiased card with neon glow ──
+    if (g_gfx || g_d2d) {
+        if (on && toggle) GdipGlow(x, y, w, h, CARD_R, accent, 10, 25);
         GdipRoundRect(x, y, w, h, CARD_R, C_CARD, border, 1);
         // Gradient header fill when active
         if (on && toggle) {
             COLORREF hdrTop = RGB(
-                (std::min)(255, GetRValue(accent) / 10 + GetRValue(C_CARD) + 10),
-                (std::min)(255, GetGValue(accent) / 10 + GetGValue(C_CARD) + 8),
-                (std::min)(255, GetBValue(accent) / 10 + GetBValue(C_CARD) + 14));
+                (std::min)(255, GetRValue(accent) / 8 + GetRValue(C_CARD) + 12),
+                (std::min)(255, GetGValue(accent) / 8 + GetGValue(C_CARD) + 10),
+                (std::min)(255, GetBValue(accent) / 8 + GetBValue(C_CARD) + 16));
             COLORREF hdrBot = C_CARD;
-            // Clip to card area for gradient header
-            Gdiplus::GraphicsPath clipPath;
-            int cd = CARD_R * 2;
-            clipPath.AddArc(x + 1, y + 1, cd, cd, 180, 90);
-            clipPath.AddArc(x + w - cd - 1, y + 1, cd, cd, 270, 90);
-            clipPath.AddLine(x + w - 1, y + CHDR, x + 1, y + CHDR);
-            clipPath.CloseFigure();
-            Gdiplus::Region clipRgn(&clipPath);
-            g_gfx->SetClip(&clipRgn);
-            GdipGradientV(x + 1, y + 1, w - 2, CHDR, hdrTop, hdrBot);
-            g_gfx->ResetClip();
+            if (g_d2d) {
+                g_d2d->PushClip((float)(x + 1), (float)(y + 1), (float)(w - 2), (float)(CHDR - 1));
+                GdipGradientV(x + 1, y + 1, w - 2, CHDR, hdrTop, hdrBot);
+                g_d2d->PopClip();
+            } else if (g_gfx) {
+                Gdiplus::GraphicsPath clipPath;
+                int cd = CARD_R * 2;
+                clipPath.AddArc(x + 1, y + 1, cd, cd, 180, 90);
+                clipPath.AddArc(x + w - cd - 1, y + 1, cd, cd, 270, 90);
+                clipPath.AddLine(x + w - 1, y + CHDR, x + 1, y + CHDR);
+                clipPath.CloseFigure();
+                Gdiplus::Region clipRgn(&clipPath);
+                g_gfx->SetClip(&clipRgn);
+                GdipGradientV(x + 1, y + 1, w - 2, CHDR, hdrTop, hdrBot);
+                g_gfx->ResetClip();
+            }
         }
-        // Header separator - subtle gradient line
-        GdipLine(x + 1, y + CHDR, x + w - 1, y + CHDR, RGB(36, 38, 40), 1.0f);
+        // Header separator with accent tint
+        COLORREF sepCol = on && toggle ? RGB(
+            (std::min)(255, GetRValue(accent) / 6 + 20),
+            (std::min)(255, GetGValue(accent) / 6 + 20),
+            (std::min)(255, GetBValue(accent) / 6 + 24)) : RGB(24, 26, 36);
+        GdipLine(x + 1, y + CHDR, x + w - 1, y + CHDR, sepCol, 1.0f);
     }
     else {
         // Fallback: original GDI
@@ -3917,60 +4021,39 @@ static int CardBegin(HDC dc, int x, int y, int w, int h, const char* title, COLO
         SelectObject(dc, bg); SelectObject(dc, pen);
         RoundRect(dc, x, y, x + w, y + h, CARD_R, CARD_R);
         DeleteObject(bg); DeleteObject(pen);
-        if (on && toggle) {
-            HBRUSH hbg = CreateSolidBrush(RGB(
-                (std::min)(255, GetRValue(accent) / 20 + GetRValue(C_CARD) + 4),
-                (std::min)(255, GetGValue(accent) / 20 + GetGValue(C_CARD) + 3),
-                (std::min)(255, GetBValue(accent) / 20 + GetBValue(C_CARD) + 6)));
-            HRGN hdrClip = CreateRoundRectRgn(x + 1, y + 1, x + w, y + CHDR + 1, CARD_R, CARD_R);
-            SelectClipRgn(dc, hdrClip);
-            RECT hr = { x + 1, y + 1, x + w - 1, y + CHDR };
-            FillRect(dc, &hr, hbg); DeleteObject(hbg);
-            SelectClipRgn(dc, NULL); DeleteObject(hdrClip);
-        }
-        HPEN hsep = CreatePen(PS_SOLID, 1, RGB(30, 32, 34));
+        HPEN hsep = CreatePen(PS_SOLID, 1, RGB(24, 26, 36));
         SelectObject(dc, hsep);
         MoveToEx(dc, x + 1, y + CHDR, NULL); LineTo(dc, x + w - 1, y + CHDR);
         DeleteObject(hsep);
     }
 
-    // Title text
-    SelectObject(dc, g_mFT); SetTextColor(dc, C_TEXT);
-    TextOutA(dc, x + CPAD_I, y + 10, title, (int)strlen(title));
+    // Title text (D2D/GDI)
+    mFontTitle(); mSetColor(C_TEXT);
+    mText(dc, x + CPAD_I, y + 12, title, (int)strlen(title));
     // Badge
     if (badge) {
-        SIZE ts; GetTextExtentPoint32A(dc, title, (int)strlen(title), &ts);
-        int bx = x + CPAD_I + ts.cx + 8;
-        SelectObject(dc, g_mFS);
-        SIZE bs; GetTextExtentPoint32A(dc, badge, (int)strlen(badge), &bs);
-        if (g_gfx) {
-            COLORREF badgeBg = RGB(GetRValue(accent) / 10 + 8, GetGValue(accent) / 10 + 6, GetBValue(accent) / 10 + 12);
-            COLORREF badgeBrd = RGB(GetRValue(accent) / 3, GetGValue(accent) / 3, GetBValue(accent) / 3);
-            GdipRoundRect(bx, y + 13, bs.cx + 10, bs.cy + 3, 3, badgeBg, badgeBrd, 1);
-        }
-        else {
-            HBRUSH bbg = CreateSolidBrush(RGB(GetRValue(accent) / 12, GetGValue(accent) / 12, GetBValue(accent) / 12));
-            RECT br = { bx, y + 13, bx + bs.cx + 10, y + 13 + bs.cy + 3 };
-            FillRect(dc, &br, bbg); DeleteObject(bbg);
-            HPEN bpen = CreatePen(PS_SOLID, 1, RGB(GetRValue(accent) / 4, GetGValue(accent) / 4, GetBValue(accent) / 4));
-            SelectObject(dc, bpen); SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(dc, bx, y + 13, bx + bs.cx + 10, y + 13 + bs.cy + 3, 4, 4);
-            DeleteObject(bpen);
-        }
-        SetTextColor(dc, accent);
-        TextOutA(dc, bx + 5, y + 14, badge, (int)strlen(badge));
+        SIZE ts; mMeasure(dc, title, (int)strlen(title), &ts);
+        int bx = x + CPAD_I + ts.cx + 10;
+        mFontSmall();
+        SIZE bs; mMeasure(dc, badge, (int)strlen(badge), &bs);
+        COLORREF badgeBg = RGB(GetRValue(accent) / 10 + 6, GetGValue(accent) / 10 + 6, GetBValue(accent) / 10 + 10);
+        COLORREF badgeBrd = RGB(GetRValue(accent) / 3, GetGValue(accent) / 3, GetBValue(accent) / 3);
+        GdipRoundRect(bx, y + 14, bs.cx + 12, bs.cy + 4, 4, badgeBg, badgeBrd, 1);
+        mSetColor(accent);
+        mText(dc, bx + 6, y + 15, badge, (int)strlen(badge));
     }
-    // Header toggle (antialiased pill + knob)
+    // Header toggle (antialiased pill + knob with neon glow)
     if (toggle) {
         int tx = x + w - CPAD_I - HTGL_W;
         int ty = y + (CHDR - HTGL_H) / 2;
         COLORREF pillCol = on ? accent : C_TOGGLE_OFF;
-        if (g_gfx) {
+        if (g_gfx || g_d2d) {
+            if (on) GdipRadialGlow(tx + HTGL_W / 2, ty + HTGL_H / 2, HTGL_W, accent, 12);
             GdipPill(tx, ty, HTGL_W, HTGL_H, pillCol);
             int kd = HTGL_H - 6;
             int kx = on ? (tx + HTGL_W - kd - 3) : (tx + 3);
             GdipCircle(kx + kd / 2, ty + HTGL_H / 2, kd / 2, on ? RGB(255, 255, 255) : C_KNOB_OFF);
-            if (on) GdipRadialGlow(kx + kd / 2, ty + HTGL_H / 2, kd + 4, accent, 25);
+            if (on) GdipRadialGlow(kx + kd / 2, ty + HTGL_H / 2, kd + 6, accent, 30);
         }
         else {
             HBRUSH pill = CreateSolidBrush(pillCol);
@@ -3994,16 +4077,17 @@ static int CardBegin(HDC dc, int x, int y, int w, int h, const char* title, COLO
 // Draw a toggle row inside a card. Returns new Y.
 static int DrawTglRow(HDC dc, int x, int y, int w, const char* label, std::atomic<bool>* val, COLORREF accent) {
     bool on = val->load();
-    SelectObject(dc, g_mF); SetTextColor(dc, on ? C_TEXT : C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y + 5, label, (int)strlen(label));
+    mFontNorm(); mSetColor(on ? C_TEXT : C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y + 6, label, (int)strlen(label));
     int tx = x + w - CPAD_I - TGL_W;
     int ty = y + (ROW_H - TGL_H) / 2;
     COLORREF pillCol = on ? accent : C_TOGGLE_OFF;
-    if (g_gfx) {
+    if (g_gfx || g_d2d) {
         GdipPill(tx, ty, TGL_W, TGL_H, pillCol);
         int kd = TGL_H - 6;
         int kx = on ? (tx + TGL_W - kd - 3) : (tx + 3);
         GdipCircle(kx + kd / 2, ty + TGL_H / 2, kd / 2, on ? RGB(255, 255, 255) : C_KNOB_OFF);
+        if (on) GdipRadialGlow(kx + kd / 2, ty + TGL_H / 2, kd + 3, accent, 18);
     }
     else {
         HBRUSH pill = CreateSolidBrush(pillCol);
@@ -4030,35 +4114,38 @@ static int DrawSldRow(HDC dc, int x, int y, int w, const char* label, float* val
     float v = *val;
     float pct = (v - lo) / (hi - lo);
     if (pct < 0) pct = 0; if (pct > 1) pct = 1;
-    SelectObject(dc, g_mF); SetTextColor(dc, C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y + 2, label, (int)strlen(label));
+    mFontNorm(); mSetColor(C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y + 2, label, (int)strlen(label));
     char vbuf[32];
     if (dec == 0) snprintf(vbuf, sizeof(vbuf), "%.0f%s", v, unit);
     else snprintf(vbuf, sizeof(vbuf), "%.1f%s", v, unit);
-    SetTextColor(dc, accent);
-    SIZE vs; GetTextExtentPoint32A(dc, vbuf, (int)strlen(vbuf), &vs);
-    TextOutA(dc, x + w - CPAD_I - vs.cx, y + 2, vbuf, (int)strlen(vbuf));
+    mSetColor(accent);
+    SIZE vs; mMeasure(dc, vbuf, (int)strlen(vbuf), &vs);
+    mText(dc, x + w - CPAD_I - vs.cx, y + 2, vbuf, (int)strlen(vbuf));
     int tL = x + CPAD_I, tR = x + w - CPAD_I, tY = y + 22;
     int knobX = tL + (int)(pct * (tR - tL));
 
-    if (g_gfx) {
-        // Track background (rounded)
+    if (g_gfx || g_d2d) {
+        // Track background (rounded pill)
         GdipRoundRect(tL, tY - 3, tR - tL, 6, 3, C_SLD_BG, C_SLD_BG, 0);
         // Filled portion with gradient
         if (knobX > tL + 2) {
             COLORREF fillDark = RGB(GetRValue(accent) / 2, GetGValue(accent) / 2, GetBValue(accent) / 2);
-            Gdiplus::GraphicsPath fp;
-            fp.AddArc(tL, tY - 3, 6, 6, 90, 180);
-            int fEnd = knobX;
-            fp.AddArc(fEnd - 6, tY - 3, 6, 6, 270, 180);
-            fp.CloseFigure();
-            Gdiplus::LinearGradientBrush gb(Gdiplus::Point(tL, tY - 3), Gdiplus::Point(tL, tY + 3), GdipCol(accent), GdipCol(fillDark));
-            g_gfx->FillPath(&gb, &fp);
+            if (g_d2d) {
+                g_d2d->GradientRoundRect((float)tL, (float)(tY - 3), (float)(knobX - tL), 6.0f, 3.0f, accent, fillDark);
+            } else {
+                Gdiplus::GraphicsPath fp;
+                fp.AddArc(tL, tY - 3, 6, 6, 90, 180);
+                int fEnd = knobX;
+                fp.AddArc(fEnd - 6, tY - 3, 6, 6, 270, 180);
+                fp.CloseFigure();
+                Gdiplus::LinearGradientBrush gb(Gdiplus::Point(tL, tY - 3), Gdiplus::Point(tL, tY + 3), GdipCol(accent), GdipCol(fillDark));
+                g_gfx->FillPath(&gb, &fp);
+            }
         }
-        // Knob with glow
-        GdipRadialGlow(knobX, tY, 10, accent, 20);
+        // Knob with neon glow
+        GdipRadialGlow(knobX, tY, 12, accent, 22);
         GdipCircle(knobX, tY, 6, accent, C_CARD, 2);
-        // White dot center
         GdipCircle(knobX, tY, 2, RGB(255, 255, 255));
     }
     else {
@@ -4089,49 +4176,51 @@ static int DrawSldRow(HDC dc, int x, int y, int w, const char* label, float* val
 
 // Draw bone selector buttons. Returns new Y.
 static int DrawBoneSel(HDC dc, int x, int y, int w, int* selected, COLORREF accent) {
-    SelectObject(dc, g_mF); SetTextColor(dc, C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y, "Target Bone", 11);
+    mFontNorm(); mSetColor(C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y, "Target Bone", 11);
     y += 16;
     int bw = (w - CPAD_I * 2 - 9) / 4;
     for (int i = 0; i < 4; i++) {
         int bx = x + CPAD_I + i * (bw + 3);
         bool sel = (*selected == i);
-        COLORREF bg = sel ? RGB(GetRValue(accent) / 6, GetGValue(accent) / 6, GetBValue(accent) / 6) : RGB(16, 16, 20);
-        COLORREF brd = sel ? accent : RGB(30, 32, 34);
-        if (g_gfx) {
-            if (sel) GdipGlow(bx, y, bw, 22, 4, accent, 4, 15);
-            GdipRoundRect(bx, y, bw, 22, 4, bg, brd, 1);
+        COLORREF bg = sel ? RGB(GetRValue(accent) / 6, GetGValue(accent) / 6, GetBValue(accent) / 6) : RGB(12, 12, 18);
+        COLORREF brd = sel ? accent : RGB(24, 26, 32);
+        if (g_gfx || g_d2d) {
+            if (sel) GdipGlow(bx, y, bw, 24, 4, accent, 5, 18);
+            GdipRoundRect(bx, y, bw, 24, 5, bg, brd, 1);
         }
         else {
             HBRUSH bb = CreateSolidBrush(bg);
             HPEN bp = CreatePen(PS_SOLID, 1, brd);
             SelectObject(dc, bb); SelectObject(dc, bp);
-            RoundRect(dc, bx, y, bx + bw, y + 22, 6, 6);
+            RoundRect(dc, bx, y, bx + bw, y + 24, 6, 6);
             DeleteObject(bb); DeleteObject(bp);
         }
-        SelectObject(dc, g_mFS);
-        SetTextColor(dc, sel ? accent : C_TEXT_DIM);
-        SIZE ts; GetTextExtentPoint32A(dc, g_boneChoiceNames[i], (int)strlen(g_boneChoiceNames[i]), &ts);
-        TextOutA(dc, bx + (bw - ts.cx) / 2, y + 4, g_boneChoiceNames[i], (int)strlen(g_boneChoiceNames[i]));
-        HitZone hz; hz.r = { bx, y, bx + bw, y + 22 }; hz.type = 2; hz.toggle = nullptr; hz.idx = i; hz.sval = (float*)selected;
+        mFontSmall(); mSetColor(sel ? accent : C_TEXT_DIM);
+        SIZE ts; mMeasure(dc, g_boneChoiceNames[i], (int)strlen(g_boneChoiceNames[i]), &ts);
+        mText(dc, bx + (bw - ts.cx) / 2, y + 5, g_boneChoiceNames[i], (int)strlen(g_boneChoiceNames[i]));
+        HitZone hz; hz.r = { bx, y, bx + bw, y + 24 }; hz.type = 2; hz.toggle = nullptr; hz.idx = i; hz.sval = (float*)selected;
         g_hz.push_back(hz);
     }
-    return y + 26;
+    return y + 28;
 }
 
 // Draw separator line. Returns new Y.
 static int DrawCSep(HDC dc, int x, int y, int w) {
-    if (g_gfx) {
-        // Gradient separator: accent edge to dark center to accent edge
+    if (g_gfx || g_d2d) {
         int lx = x + CPAD_I, rx = x + w - CPAD_I, sy2 = y + SEP_H / 2;
-        int mid = (lx + rx) / 2;
-        Gdiplus::LinearGradientBrush gb(Gdiplus::Point(lx, sy2), Gdiplus::Point(rx, sy2),
-            GdipCol(RGB(22, 22, 26), 60), GdipCol(RGB(40, 42, 44), 180));
-        Gdiplus::Pen gp(&gb, 1.0f);
-        g_gfx->DrawLine(&gp, lx, sy2, rx, sy2);
+        if (g_d2d) {
+            g_d2d->GradientH((float)lx, (float)sy2, (float)(rx - lx), 1.0f,
+                RGB(18, 18, 24), RGB(32, 34, 42));
+        } else {
+            Gdiplus::LinearGradientBrush gb(Gdiplus::Point(lx, sy2), Gdiplus::Point(rx, sy2),
+                GdipCol(RGB(18, 18, 24), 60), GdipCol(RGB(32, 34, 42), 180));
+            Gdiplus::Pen gp(&gb, 1.0f);
+            g_gfx->DrawLine(&gp, lx, sy2, rx, sy2);
+        }
     }
     else {
-        HPEN p = CreatePen(PS_SOLID, 1, RGB(28, 30, 32));
+        HPEN p = CreatePen(PS_SOLID, 1, RGB(22, 24, 32));
         SelectObject(dc, p);
         MoveToEx(dc, x + CPAD_I, y + SEP_H / 2, NULL); LineTo(dc, x + w - CPAD_I, y + SEP_H / 2);
         DeleteObject(p);
@@ -4141,47 +4230,36 @@ static int DrawCSep(HDC dc, int x, int y, int w) {
 
 // Draw label + colored value row. Returns new Y.
 static int DrawLabelVal(HDC dc, int x, int y, int w, const char* label, const char* val, COLORREF vc) {
-    SelectObject(dc, g_mF);
-    SetTextColor(dc, C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
-    SetTextColor(dc, vc);
-    SIZE vs; GetTextExtentPoint32A(dc, val, (int)strlen(val), &vs);
-    TextOutA(dc, x + w - CPAD_I - vs.cx, y + 3, val, (int)strlen(val));
+    mFontNorm(); mSetColor(C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
+    mSetColor(vc);
+    SIZE vs; mMeasure(dc, val, (int)strlen(val), &vs);
+    mText(dc, x + w - CPAD_I - vs.cx, y + 3, val, (int)strlen(val));
     return y + LABEL_H;
 }
 
 // Draw label + key badge. Returns new Y.
 static int DrawKeyRow(HDC dc, int x, int y, int w, const char* label, const char* key) {
-    SelectObject(dc, g_mF);
-    SetTextColor(dc, C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
-    SIZE ks; GetTextExtentPoint32A(dc, key, (int)strlen(key), &ks);
-    int kx = x + w - CPAD_I - ks.cx - 12;
-    HBRUSH kb = CreateSolidBrush(RGB(24, 24, 28));
-    RECT kr = { kx, y + 1, kx + ks.cx + 12, y + LABEL_H - 1 };
-    FillRect(dc, &kr, kb); DeleteObject(kb);
-    HPEN kp = CreatePen(PS_SOLID, 1, RGB(36, 38, 40));
-    SelectObject(dc, kp); SelectObject(dc, GetStockObject(NULL_BRUSH));
-    RoundRect(dc, kr.left, kr.top, kr.right, kr.bottom, 4, 4);
-    DeleteObject(kp);
-    SetTextColor(dc, RGB(140, 142, 148));
-    TextOutA(dc, kx + 6, y + 3, key, (int)strlen(key));
+    mFontNorm(); mSetColor(C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
+    mFontSmall();
+    SIZE ks; mMeasure(dc, key, (int)strlen(key), &ks);
+    int kx = x + w - CPAD_I - ks.cx - 14;
+    mRoundRect(dc, kx, y + 1, ks.cx + 14, LABEL_H - 2, 4, RGB(16, 16, 24), RGB(28, 30, 38), 1);
+    mSetColor(RGB(130, 135, 150));
+    mText(dc, kx + 7, y + 4, key, (int)strlen(key));
     return y + LABEL_H;
 }
 
 // Draw color swatch row. Returns new Y.
 static int DrawSwatchRow(HDC dc, int x, int y, int w, const char* label, COLORREF col, int colorIdx) {
-    SelectObject(dc, g_mF); SetTextColor(dc, C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
-    int sx = x + w - CPAD_I - 22, sy2 = y + 2;
-    HBRUSH sb = CreateSolidBrush(col);
-    RECT sr = { sx, sy2, sx + 22, sy2 + 14 }; FillRect(dc, &sr, sb); DeleteObject(sb);
-    HPEN sp2 = CreatePen(PS_SOLID, 1, RGB(50, 52, 54));
-    SelectObject(dc, sp2); SelectObject(dc, GetStockObject(NULL_BRUSH));
-    RoundRect(dc, sx, sy2, sx + 22, sy2 + 14, 3, 3);
-    DeleteObject(sp2);
+    mFontNorm(); mSetColor(C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
+    int sx = x + w - CPAD_I - 24, sy2 = y + 2;
+    mFillRect(dc, sx, sy2, 24, 16, col);
+    mRoundRect(dc, sx, sy2, 24, 16, 3, col, RGB(42, 44, 52), 1);
     // Hit zone for color picker
-    HitZone hz; hz.r = { sx - 4, sy2 - 4, sx + 26, sy2 + 18 }; hz.type = 4; hz.toggle = nullptr; hz.idx = colorIdx; hz.sval = nullptr;
+    HitZone hz; hz.r = { sx - 4, sy2 - 4, sx + 28, sy2 + 20 }; hz.type = 4; hz.toggle = nullptr; hz.idx = colorIdx; hz.sval = nullptr;
     g_hz.push_back(hz);
     return y + LABEL_H;
 }
@@ -4189,45 +4267,39 @@ static int DrawSwatchRow(HDC dc, int x, int y, int w, const char* label, COLORRE
 // Draw an info box with text lines. Returns new Y.
 static int DrawInfoBox(HDC dc, int x, int y, int w, COLORREF accent, const char** lines, int nlines) {
     int h = 8 + nlines * 16 + 8;
-    COLORREF bg = RGB(GetRValue(accent) / 16 + 14, GetGValue(accent) / 16 + 12, GetBValue(accent) / 16 + 22);
-    COLORREF brd = RGB(GetRValue(accent) / 8 + 20, GetGValue(accent) / 8 + 18, GetBValue(accent) / 8 + 30);
-    HBRUSH bb = CreateSolidBrush(bg);
-    HPEN bp = CreatePen(PS_SOLID, 1, brd);
-    SelectObject(dc, bb); SelectObject(dc, bp);
-    RoundRect(dc, x + CPAD_I, y, x + w - CPAD_I, y + h, 6, 6);
-    DeleteObject(bb); DeleteObject(bp);
-    SelectObject(dc, g_mFS); SetTextColor(dc, RGB(150, 152, 156));
+    COLORREF bg = RGB(GetRValue(accent) / 16 + 8, GetGValue(accent) / 16 + 8, GetBValue(accent) / 16 + 14);
+    COLORREF brd = RGB(GetRValue(accent) / 8 + 16, GetGValue(accent) / 8 + 16, GetBValue(accent) / 8 + 24);
+    mRoundRect(dc, x + CPAD_I, y, w - CPAD_I * 2, h, 6, bg, brd, 1);
+    mFontSmall(); mSetColor(RGB(140, 145, 160));
     for (int i = 0; i < nlines; i++) {
-        TextOutA(dc, x + CPAD_I + 8, y + 8 + i * 16, lines[i], (int)strlen(lines[i]));
+        mText(dc, x + CPAD_I + 10, y + 8 + i * 16, lines[i], (int)strlen(lines[i]));
     }
     return y + h + 4;
 }
 
 // Draw description text. Returns new Y.
 static int DrawDesc(HDC dc, int x, int y, int w, const char* text) {
-    SelectObject(dc, g_mFS); SetTextColor(dc, RGB(90, 94, 98));
-    // Simple single-line (or use DrawTextA for wrapping)
+    if (g_d2d) {
+        float h = g_d2d->TextWrapped(text, (float)(x + CPAD_I), (float)y,
+            (float)(w - CPAD_I * 2), RGB(80, 88, 105), g_menuD2D.fontMenuSmall.Get());
+        return y + (int)h + 4;
+    }
+    mFontSmall(); mSetColor( RGB(80, 88, 105));
     RECT r = { x + CPAD_I, y, x + w - CPAD_I, y + 40 };
     DrawTextA(dc, text, -1, &r, DT_WORDBREAK | DT_LEFT | DT_TOP);
-    int h = DrawTextA(dc, text, -1, &r, DT_WORDBREAK | DT_LEFT | DT_TOP | DT_CALCRECT);
+    DrawTextA(dc, text, -1, &r, DT_WORDBREAK | DT_LEFT | DT_TOP | DT_CALCRECT);
     return y + (r.bottom - r.top) + 4;
 }
 
 // Draw a dropdown (display only, click cycles). Returns new Y.
 static int DrawDropRow(HDC dc, int x, int y, int w, const char* label, const char* val, COLORREF accent, int* choice, int nChoices) {
-    SelectObject(dc, g_mFS); SetTextColor(dc, C_TEXT_DIM);
-    TextOutA(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
-    SIZE vs; GetTextExtentPoint32A(dc, val, (int)strlen(val), &vs);
-    int dx = x + w - CPAD_I - vs.cx - 12;
-    HBRUSH db = CreateSolidBrush(RGB(18, 18, 22));
-    RECT dr = { dx, y + 1, x + w - CPAD_I, y + LABEL_H - 1 };
-    FillRect(dc, &dr, db); DeleteObject(db);
-    HPEN dp = CreatePen(PS_SOLID, 1, RGB(36, 38, 40));
-    SelectObject(dc, dp); SelectObject(dc, GetStockObject(NULL_BRUSH));
-    RoundRect(dc, dr.left, dr.top, dr.right, dr.bottom, 4, 4);
-    DeleteObject(dp);
-    SetTextColor(dc, RGB(165, 168, 172));
-    TextOutA(dc, dx + 6, y + 3, val, (int)strlen(val));
+    mFontSmall(); mSetColor(C_TEXT_DIM);
+    mText(dc, x + CPAD_I, y + 3, label, (int)strlen(label));
+    SIZE vs; mMeasure(dc, val, (int)strlen(val), &vs);
+    int dx = x + w - CPAD_I - vs.cx - 14;
+    mRoundRect(dc, dx, y + 1, vs.cx + 14, LABEL_H - 2, 4, RGB(12, 12, 18), RGB(28, 30, 38), 1);
+    mSetColor(RGB(155, 160, 175));
+    mText(dc, dx + 7, y + 3, val, (int)strlen(val));
     // Hit zone for cycling
     HitZone hz; hz.r = { dx, y, x + w - CPAD_I, y + LABEL_H }; hz.type = 7;
     hz.toggle = nullptr; hz.idx = 0; hz.sval = (float*)choice; hz.slo = 0; hz.shi = (float)nChoices; hz.sstep = 1;
@@ -4507,15 +4579,11 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
         // "Set Target XYZ" button
         {
             int bx = x1 + CPAD_I, by = y + 2, bw2 = COLW - CPAD_I * 2, bh = ROW_H - 4;
-            HBRUSH bb = CreateSolidBrush(RGB(16, 28, 28));
-            HPEN bp = CreatePen(PS_SOLID, 1, RGB(0, 160, 160));
-            SelectObject(dc, bb); SelectObject(dc, bp);
-            RoundRect(dc, bx, by, bx + bw2, by + bh, 4, 4);
-            DeleteObject(bb); DeleteObject(bp);
-            SelectObject(dc, g_mFS); SetTextColor(dc, RGB(0, 230, 118));
+            mRoundRect(dc, bx, by, bw2, bh, 5, RGB(10, 22, 22), RGB(0, 140, 140), 1);
+            mFontSmall(); mSetColor(RGB(0, 230, 118));
             const char* setTxt = "Set Target X, Y, Z";
-            SIZE ss; GetTextExtentPoint32A(dc, setTxt, (int)strlen(setTxt), &ss);
-            TextOutA(dc, bx + (bw2 - ss.cx) / 2, by + 4, setTxt, (int)strlen(setTxt));
+            SIZE ss; mMeasure(dc, setTxt, (int)strlen(setTxt), &ss);
+            mText(dc, bx + (bw2 - ss.cx) / 2, by + 4, setTxt, (int)strlen(setTxt));
             HitZone hz; hz.r = { bx, by, bx + bw2, by + bh }; hz.type = 12; hz.toggle = nullptr; hz.idx = 0; hz.sval = nullptr;
             g_hz.push_back(hz);
             y += ROW_H;
@@ -4523,15 +4591,11 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
         // "Clear Target" button
         if (g_mortarSet) {
             int bx = x1 + CPAD_I, by = y + 2, bw2 = COLW - CPAD_I * 2, bh = ROW_H - 4;
-            HBRUSH bb = CreateSolidBrush(RGB(24, 16, 16));
-            HPEN bp = CreatePen(PS_SOLID, 1, RGB(160, 60, 60));
-            SelectObject(dc, bb); SelectObject(dc, bp);
-            RoundRect(dc, bx, by, bx + bw2, by + bh, 4, 4);
-            DeleteObject(bb); DeleteObject(bp);
-            SelectObject(dc, g_mFS); SetTextColor(dc, RGB(245, 85, 85));
+            mRoundRect(dc, bx, by, bw2, bh, 5, RGB(22, 10, 10), RGB(140, 50, 50), 1);
+            mFontSmall(); mSetColor(RGB(245, 85, 85));
             const char* clrTxt = "Clear Target";
-            SIZE cs; GetTextExtentPoint32A(dc, clrTxt, (int)strlen(clrTxt), &cs);
-            TextOutA(dc, bx + (bw2 - cs.cx) / 2, by + 4, clrTxt, (int)strlen(clrTxt));
+            SIZE cs; mMeasure(dc, clrTxt, (int)strlen(clrTxt), &cs);
+            mText(dc, bx + (bw2 - cs.cx) / 2, by + 4, clrTxt, (int)strlen(clrTxt));
             HitZone hz; hz.r = { bx, by, bx + bw2, by + bh }; hz.type = 13; hz.toggle = nullptr; hz.idx = 0; hz.sval = nullptr;
             g_hz.push_back(hz);
             y += ROW_H;
@@ -4594,8 +4658,8 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
         int y = cy + CHDR + 4;
         y = DrawDesc(dc, x0, y, COLW, "ESP markers at saved world positions.");
         if (wpCount == 0) {
-            SelectObject(dc, g_mFS); SetTextColor(dc, C_TEXT_VDIM);
-            TextOutA(dc, x0 + CPAD_I, y + 4, "No waypoints saved", 18);
+            mFontSmall(); mSetColor(C_TEXT_VDIM);
+            mText(dc, x0 + CPAD_I, y + 4, "No waypoints saved", 18);
             y += LABEL_H;
         }
         else {
@@ -4612,15 +4676,11 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
         // "Add Current Position" button
         {
             int bx = x0 + CPAD_I, by = y + 2, bw2 = COLW - CPAD_I * 2, bh = ROW_H - 4;
-            HBRUSH bb = CreateSolidBrush(RGB(24, 24, 28));
-            HPEN bp = CreatePen(PS_SOLID, 1, RGB(0, 170, 255));
-            SelectObject(dc, bb); SelectObject(dc, bp);
-            RoundRect(dc, bx, by, bx + bw2, by + bh, 4, 4);
-            DeleteObject(bb); DeleteObject(bp);
-            SelectObject(dc, g_mFS); SetTextColor(dc, RGB(0, 170, 255));
+            mRoundRect(dc, bx, by, bw2, bh, 5, RGB(10, 16, 24), RGB(0, 140, 220), 1);
+            mFontSmall(); mSetColor(RGB(0, 170, 255));
             const char* addTxt = "+ Where I'm Standing";
-            SIZE as; GetTextExtentPoint32A(dc, addTxt, (int)strlen(addTxt), &as);
-            TextOutA(dc, bx + (bw2 - as.cx) / 2, by + 4, addTxt, (int)strlen(addTxt));
+            SIZE as; mMeasure(dc, addTxt, (int)strlen(addTxt), &as);
+            mText(dc, bx + (bw2 - as.cx) / 2, by + 4, addTxt, (int)strlen(addTxt));
             HitZone hz; hz.r = { bx, by, bx + bw2, by + bh }; hz.type = 8; hz.toggle = nullptr; hz.idx = 0; hz.sval = nullptr;
             g_hz.push_back(hz);
             y += ROW_H;
@@ -4628,15 +4688,11 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
         // "Add Custom XYZ" button
         {
             int bx = x0 + CPAD_I, by = y + 2, bw2 = COLW - CPAD_I * 2, bh = ROW_H - 4;
-            HBRUSH bb = CreateSolidBrush(RGB(20, 18, 30));
-            HPEN bp = CreatePen(PS_SOLID, 1, RGB(100, 95, 130));
-            SelectObject(dc, bb); SelectObject(dc, bp);
-            RoundRect(dc, bx, by, bx + bw2, by + bh, 4, 4);
-            DeleteObject(bb); DeleteObject(bp);
-            SelectObject(dc, g_mFS); SetTextColor(dc, RGB(140, 135, 165));
+            mRoundRect(dc, bx, by, bw2, bh, 5, RGB(14, 12, 24), RGB(80, 75, 110), 1);
+            mFontSmall(); mSetColor(RGB(140, 135, 165));
             const char* custTxt = "+ Custom X, Y, Z";
-            SIZE cs; GetTextExtentPoint32A(dc, custTxt, (int)strlen(custTxt), &cs);
-            TextOutA(dc, bx + (bw2 - cs.cx) / 2, by + 4, custTxt, (int)strlen(custTxt));
+            SIZE cs; mMeasure(dc, custTxt, (int)strlen(custTxt), &cs);
+            mText(dc, bx + (bw2 - cs.cx) / 2, by + 4, custTxt, (int)strlen(custTxt));
             HitZone hz; hz.r = { bx, by, bx + bw2, by + bh }; hz.type = 11; hz.toggle = nullptr; hz.idx = 0; hz.sval = nullptr;
             g_hz.push_back(hz);
         }
@@ -4655,17 +4711,11 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
         CardBegin(dc, x0, cy, fullW, ch, "Hit Log", RGB(245, 85, 85), nullptr, nullptr);
         int y = cy + CHDR + 4;
         // Log area background
-        HBRUSH lbg = CreateSolidBrush(RGB(10, 10, 12));
-        RECT lr = { x0 + CPAD_I, y, x0 + fullW - CPAD_I, y + logH + 4 };
-        FillRect(dc, &lr, lbg); DeleteObject(lbg);
-        HPEN lp = CreatePen(PS_SOLID, 1, RGB(22, 20, 34));
-        SelectObject(dc, lp); SelectObject(dc, GetStockObject(NULL_BRUSH));
-        RoundRect(dc, lr.left, lr.top, lr.right, lr.bottom, 6, 6);
-        DeleteObject(lp);
-        SelectObject(dc, g_mFS);
+        mRoundRect(dc, x0 + CPAD_I, y, fullW - CPAD_I * 2, logH + 4, 6, RGB(8, 8, 14), RGB(22, 20, 32), 1);
+        mFontSmall();
         if (logCount == 0) {
-            SetTextColor(dc, C_TEXT_VDIM);
-            TextOutA(dc, x0 + CPAD_I + 8, y + 6, "No hits recorded yet", 20);
+            mSetColor( C_TEXT_VDIM);
+            mText(dc, x0 + CPAD_I + 8, y + 6, "No hits recorded yet", 20);
         }
         else {
             // Show hits newest first (max 8)
@@ -4681,23 +4731,23 @@ static int DrawExploitsPage(HDC dc, int scrollY) {
                 char timeBuf[16];
                 if (secsAgo < 60) snprintf(timeBuf, sizeof(timeBuf), "%ds ago", secsAgo);
                 else snprintf(timeBuf, sizeof(timeBuf), "%dm ago", secsAgo / 60);
-                SetTextColor(dc, C_TEXT_VDIM);
-                TextOutA(dc, x0 + CPAD_I + 8, ry, timeBuf, (int)strlen(timeBuf));
+                mSetColor( C_TEXT_VDIM);
+                mText(dc, x0 + CPAD_I + 8, ry, timeBuf, (int)strlen(timeBuf));
                 // HIT badge
-                SetTextColor(dc, RGB(245, 85, 85));
-                TextOutA(dc, x0 + CPAD_I + 70, ry, "HIT", 3);
+                mSetColor( RGB(245, 85, 85));
+                mText(dc, x0 + CPAD_I + 70, ry, "HIT", 3);
                 // Details
                 char detBuf[64];
                 snprintf(detBuf, sizeof(detBuf), "%s  %.0fm  %s", he.bone.c_str(), he.dist, he.method.c_str());
-                SetTextColor(dc, C_TEXT_DIM);
-                TextOutA(dc, x0 + CPAD_I + 100, ry, detBuf, (int)strlen(detBuf));
+                mSetColor( C_TEXT_DIM);
+                mText(dc, x0 + CPAD_I + 100, ry, detBuf, (int)strlen(detBuf));
             }
         }
         // Total hits count on right side
         char totBuf[32]; snprintf(totBuf, sizeof(totBuf), "Total: %d", g_totalHits);
-        SIZE ts; GetTextExtentPoint32A(dc, totBuf, (int)strlen(totBuf), &ts);
-        SetTextColor(dc, RGB(245, 85, 85));
-        TextOutA(dc, x0 + fullW - CPAD_I - ts.cx - 4, cy + CHDR - ts.cy - 4, totBuf, (int)strlen(totBuf));
+        SIZE ts; mMeasure(dc, totBuf, (int)strlen(totBuf), &ts);
+        mSetColor( RGB(245, 85, 85));
+        mText(dc, x0 + fullW - CPAD_I - ts.cx - 4, cy + CHDR - ts.cy - 4, totBuf, (int)strlen(totBuf));
 
         maxCol += ch + CGAP;
         return maxCol;
@@ -4749,7 +4799,7 @@ static int DrawConfigPage(HDC dc, int scrollY) {
         Stat stats[8];
         snprintf(stats[0].v, 32, "v1.28.8"); stats[0].l = "VERSION"; stats[0].c = C_ACCENT;
         snprintf(stats[1].v, 32, "Active"); stats[1].l = "DRIVER"; stats[1].c = C_GREEN;
-        snprintf(stats[2].v, 32, g_espOverlay.initialized ? "D2D" : "GDI"); stats[2].l = "OVERLAY"; stats[2].c = g_espOverlay.initialized ? RGB(0, 200, 120) : RGB(0, 170, 255);
+        snprintf(stats[2].v, 32, g_menuD2D.initialized ? "DirectX" : "GDI+"); stats[2].l = "RENDERER"; stats[2].c = g_menuD2D.initialized ? RGB(0, 255, 136) : RGB(0, 170, 255);
         snprintf(stats[3].v, 32, "~500"); stats[3].l = "FPS"; stats[3].c = RGB(245, 190, 50);
         snprintf(stats[4].v, 32, "--"); stats[4].l = "ENTITIES"; stats[4].c = RGB(0, 170, 255);
         snprintf(stats[5].v, 32, "--"); stats[5].l = "ITEMS"; stats[5].c = RGB(245, 190, 50);
@@ -4762,16 +4812,11 @@ static int DrawConfigPage(HDC dc, int scrollY) {
             int col = i % 4, row = i / 4;
             int cx = x0 + CPAD_I + col * (cellW + 8);
             int cy2 = y + row * (cellH + 6);
-            HBRUSH cb = CreateSolidBrush(RGB(16, 16, 20));
-            RECT cr = { cx, cy2, cx + cellW, cy2 + cellH }; FillRect(dc, &cr, cb); DeleteObject(cb);
-            HPEN cp = CreatePen(PS_SOLID, 1, RGB(28, 30, 32));
-            SelectObject(dc, cp); SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(dc, cx, cy2, cx + cellW, cy2 + cellH, 6, 6);
-            DeleteObject(cp);
-            SelectObject(dc, g_mFS); SetTextColor(dc, C_TEXT_VDIM);
-            TextOutA(dc, cx + 8, cy2 + 4, stats[i].l, (int)strlen(stats[i].l));
-            SelectObject(dc, g_mFT); SetTextColor(dc, stats[i].c);
-            TextOutA(dc, cx + 8, cy2 + 20, stats[i].v, (int)strlen(stats[i].v));
+            mRoundRect(dc, cx, cy2, cellW, cellH, 6, RGB(10, 10, 16), RGB(22, 24, 30), 1);
+            mFontSmall(); mSetColor(C_TEXT_VDIM);
+            mText(dc, cx + 8, cy2 + 4, stats[i].l, (int)strlen(stats[i].l));
+            mFontTitle(); mSetColor( stats[i].c);
+            mText(dc, cx + 8, cy2 + 20, stats[i].v, (int)strlen(stats[i].v));
         }
         maxCol += ch + CGAP;
         return maxCol;
@@ -4815,16 +4860,16 @@ static int DrawFilterPage(HDC dc, int scrollY) {
         SelectObject(dc, sp3); SelectObject(dc, GetStockObject(NULL_BRUSH));
         RoundRect(dc, sr.left, sr.top, sr.right, sr.bottom, 4, 4);
         DeleteObject(sp3);
-        SelectObject(dc, g_mF);
+        mFontNorm();
         if (filterDisplay.empty()) {
-            SetTextColor(dc, C_TEXT_VDIM);
-            TextOutA(dc, x0 + CPAD_I + 8, y + 6, "Search items...", 15);
+            mSetColor( C_TEXT_VDIM);
+            mText(dc, x0 + CPAD_I + 8, y + 6, "Search items...", 15);
         }
         else {
-            SetTextColor(dc, C_TEXT);
-            TextOutA(dc, x0 + CPAD_I + 8, y + 6, filterDisplay.c_str(), (int)filterDisplay.length());
+            mSetColor( C_TEXT);
+            mText(dc, x0 + CPAD_I + 8, y + 6, filterDisplay.c_str(), (int)filterDisplay.length());
             if ((GetTickCount() / 500) % 2 == 0) {
-                SIZE cs2; GetTextExtentPoint32A(dc, filterDisplay.c_str(), (int)filterDisplay.length(), &cs2);
+                SIZE cs2; mMeasure(dc, filterDisplay.c_str(), (int)filterDisplay.length(), &cs2);
                 HPEN cp2 = CreatePen(PS_SOLID, 1, RGB(245, 190, 50)); SelectObject(dc, cp2);
                 MoveToEx(dc, x0 + CPAD_I + 8 + cs2.cx + 2, y + 4, NULL); LineTo(dc, x0 + CPAD_I + 8 + cs2.cx + 2, y + 24); DeleteObject(cp2);
             }
@@ -4849,8 +4894,8 @@ static int DrawFilterPage(HDC dc, int scrollY) {
         char hdr2[80];
         if (numSelected > 0) snprintf(hdr2, sizeof(hdr2), "%d items - %d selected  [CLEAR]", numItems, numSelected);
         else snprintf(hdr2, sizeof(hdr2), "%d items nearby", numItems);
-        SelectObject(dc, g_mFS); SetTextColor(dc, numSelected > 0 ? RGB(245, 190, 50) : C_TEXT_DIM);
-        TextOutA(dc, x0 + CPAD_I, y, hdr2, (int)strlen(hdr2));
+        mFontSmall(); mSetColor( numSelected > 0 ? RGB(245, 190, 50) : C_TEXT_DIM);
+        mText(dc, x0 + CPAD_I, y, hdr2, (int)strlen(hdr2));
         if (numSelected > 0) {
             // Clear button hit zone
             HitZone hz; hz.r = { x0 + CPAD_I, y, x0 + fullW - CPAD_I, y + 16 };
@@ -4869,8 +4914,8 @@ static int DrawFilterPage(HDC dc, int scrollY) {
                 HBRUSH accBr = CreateSolidBrush(catCol);
                 RECT accR = { x0 + CPAD_I, y + 3, x0 + CPAD_I + 3, y + FILTER_ROW_H - 3 };
                 FillRect(dc, &accR, accBr); DeleteObject(accBr);
-                SelectObject(dc, g_mFS); SetTextColor(dc, catCol);
-                TextOutA(dc, x0 + CPAD_I + 8, y + 4, g_catNames[fr.catIdx], (int)strlen(g_catNames[fr.catIdx]));
+                mFontSmall(); mSetColor( catCol);
+                mText(dc, x0 + CPAD_I + 8, y + 4, g_catNames[fr.catIdx], (int)strlen(g_catNames[fr.catIdx]));
             }
             else {
                 int ii = fr.itemIdx;
@@ -4900,8 +4945,8 @@ static int DrawFilterPage(HDC dc, int scrollY) {
                     Rectangle(dc, cbx, cby, cbx + cbs, cby + cbs);
                 }
                 DeleteObject(cbp);
-                SelectObject(dc, g_mF); SetTextColor(dc, selected ? C_TEXT : C_TEXT_DIM);
-                TextOutA(dc, x0 + CPAD_I + 32, y + 3, name.c_str(), (int)name.length());
+                mFontNorm(); mSetColor( selected ? C_TEXT : C_TEXT_DIM);
+                mText(dc, x0 + CPAD_I + 32, y + 3, name.c_str(), (int)name.length());
                 // Hit zone for row
                 HitZone hz; hz.r = { x0 + CPAD_I, y, x0 + fullW - CPAD_I, y + FILTER_ROW_H };
                 hz.type = 6; hz.toggle = nullptr; hz.idx = ri; hz.sval = nullptr;
@@ -4913,15 +4958,15 @@ static int DrawFilterPage(HDC dc, int scrollY) {
             y += FILTER_ROW_H;
         }
         if (totalRows > FILTER_MAX_VISIBLE) {
-            SelectObject(dc, g_mFS); SetTextColor(dc, C_TEXT_VDIM);
+            mFontSmall(); mSetColor(C_TEXT_VDIM);
             int endRow = g_filterScroll + FILTER_MAX_VISIBLE;
             if (endRow > totalRows) endRow = totalRows;
             char si2[48]; snprintf(si2, sizeof(si2), "scroll %d-%d of %d", g_filterScroll + 1, endRow, totalRows);
-            TextOutA(dc, x0 + CPAD_I, y + 2, si2, (int)strlen(si2));
+            mText(dc, x0 + CPAD_I, y + 2, si2, (int)strlen(si2));
         }
         if (numItems == 0) {
-            SelectObject(dc, g_mFS); SetTextColor(dc, C_TEXT_VDIM);
-            TextOutA(dc, x0 + CPAD_I, y + 4, g_showItems.load() ? "No items in range" : "Enable Item ESP first", 21);
+            mFontSmall(); mSetColor(C_TEXT_VDIM);
+            mText(dc, x0 + CPAD_I, y + 4, g_showItems.load() ? "No items in range" : "Enable Item ESP first", 21);
         }
         cy += ch + CGAP;
     }
@@ -5236,99 +5281,144 @@ static LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc; GetClientRect(hwnd, &rc); int w = rc.right, h = rc.bottom;
-        HDC mem = CreateCompatibleDC(hdc);
-        HBITMAP mbitmap = CreateCompatibleBitmap(hdc, w, h);
-        HBITMAP ob = (HBITMAP)SelectObject(mem, mbitmap);
-        SetBkMode(mem, TRANSPARENT);
+        // ═══════════════════════════════════════════════════════════════
+        //  DIRECTX RENDERING PIPELINE — "NEON PULSE" Design
+        //  Uses D2D DeviceContext via swap chain (hardware-accelerated)
+        //  Falls back to GDI+ if D2D is not initialized
+        // ═══════════════════════════════════════════════════════════════
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps); // validate immediately — D2D renders independently
 
-        // ── GDI+ setup for this frame ──
-        Gdiplus::Graphics gfx(mem);
-        gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        gfx.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-        g_gfx = &gfx;
+        int w = MW, h = MH;
+        HDC mem = nullptr; // used only for GDI fallback path
+
+        // ── Setup rendering context (D2D or GDI+ fallback) ──
+        Gdiplus::Graphics* gfxPtr = nullptr;
+        HDC fallbackDC = nullptr;
+        HBITMAP mbitmap = nullptr, ob = nullptr;
+        if (g_menuD2D.initialized) {
+            // D2D path: render via DirectX device context
+            g_menuD2D.dc->BeginDraw();
+            g_menuD2D.dc->Clear(D2DOverlay::Col(C_BG));
+            g_d2d = &g_menuD2D;
+            g_gfx = nullptr;
+            mem = nullptr; // no GDI DC needed
+            // Initialize text state for D2D
+            mFontNorm();
+        }
+        else {
+            // Fallback: GDI+ (same as before)
+            HDC hdc2 = GetDC(hwnd);
+            mem = CreateCompatibleDC(hdc2);
+            mbitmap = CreateCompatibleBitmap(hdc2, w, h);
+            ob = (HBITMAP)SelectObject(mem, mbitmap);
+            SetBkMode(mem, TRANSPARENT);
+            gfxPtr = new Gdiplus::Graphics(mem);
+            gfxPtr->SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            gfxPtr->SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+            g_gfx = gfxPtr;
+            g_d2d = nullptr;
+            HBRUSH bgBr = CreateSolidBrush(C_BG); RECT rc = { 0, 0, w, h };
+            FillRect(mem, &rc, bgBr); DeleteObject(bgBr);
+            ReleaseDC(hwnd, hdc2);
+        }
 
         // Clear hit zones and live sliders for this frame
         g_hz.clear();
         g_liveSliders.clear();
 
-        // Full background
-        HBRUSH bgBr = CreateSolidBrush(C_BG); FillRect(mem, &rc, bgBr); DeleteObject(bgBr);
+        // ── Sidebar with gradient + neon accent ──
+        GdipGradientV(0, HDR_H, SB_W, h - HDR_H, RGB(10, 10, 16), RGB(6, 6, 10));
+        GdipLine(SB_W - 1, HDR_H, SB_W - 1, h, RGB(20, 22, 32), 1.0f);
 
-        // ── Sidebar with vertical gradient ──
-        GdipGradientV(0, HDR_H, SB_W, h - HDR_H, RGB(15, 15, 18), RGB(10, 10, 12));
-        GdipLine(SB_W - 1, HDR_H, SB_W - 1, h, RGB(34, 38, 36), 1.0f);
-
-        // ── Sidebar icons (GDI+ enhanced) ──
+        // ── Sidebar icons ──
         {
-            int sy = HDR_H + 16;
+            int sy = HDR_H + 18;
             for (int i = 0; i < SB_COUNT; i++) {
                 int iy = sy + i * (SB_ICON_SZ + SB_ICON_GAP);
                 bool active = (g_sbItems[i].page == g_menuPage);
                 bool hov = (i == g_sidebarHover);
                 int ix = (SB_W - SB_ICON_SZ) / 2;
                 if (active) {
-                    // Glowing active indicator
-                    GdipGlow(ix, iy, SB_ICON_SZ, SB_ICON_SZ, 7, C_ACCENT, 6, 22);
-                    COLORREF abg = RGB(GetRValue(C_ACCENT) / 12 + 14, GetGValue(C_ACCENT) / 12 + 14, GetBValue(C_ACCENT) / 12 + 14);
-                    COLORREF abrd = RGB(GetRValue(C_ACCENT) / 5 + 22, GetGValue(C_ACCENT) / 5 + 22, GetBValue(C_ACCENT) / 5 + 22);
-                    GdipRoundRect(ix, iy, SB_ICON_SZ, SB_ICON_SZ, 7, abg, abrd, 1);
-                    // Accent pip on left edge
-                    GdipRoundRect(0, iy + 8, 3, SB_ICON_SZ - 16, 2, C_ACCENT, C_ACCENT, 0);
+                    // Neon glow active indicator
+                    GdipGlow(ix, iy, SB_ICON_SZ, SB_ICON_SZ, 8, C_ACCENT, 8, 28);
+                    COLORREF abg = RGB(GetRValue(C_ACCENT) / 14 + 6, GetGValue(C_ACCENT) / 14 + 6, GetBValue(C_ACCENT) / 14 + 10);
+                    COLORREF abrd = RGB(GetRValue(C_ACCENT) / 4 + 16, GetGValue(C_ACCENT) / 4 + 16, GetBValue(C_ACCENT) / 4 + 20);
+                    GdipRoundRect(ix, iy, SB_ICON_SZ, SB_ICON_SZ, 8, abg, abrd, 1);
+                    // Neon accent pip on left edge
+                    if (g_d2d) g_d2d->NeonLine(1.5f, (float)(iy + 10), 1.5f, (float)(iy + SB_ICON_SZ - 10), C_ACCENT, 2.0f);
+                    else GdipRoundRect(0, iy + 8, 3, SB_ICON_SZ - 16, 2, C_ACCENT, C_ACCENT, 0);
                 }
                 else if (hov) {
-                    GdipRoundRect(ix, iy, SB_ICON_SZ, SB_ICON_SZ, 7, RGB(20, 20, 24), RGB(32, 34, 36), 1);
+                    GdipRoundRect(ix, iy, SB_ICON_SZ, SB_ICON_SZ, 8, RGB(14, 14, 20), RGB(24, 26, 34), 1);
                 }
-                COLORREF ic = active ? C_ACCENT : RGB(65, 68, 72);
+                COLORREF ic = active ? C_ACCENT : RGB(50, 55, 70);
                 int icx = SB_W / 2, icy = iy + SB_ICON_SZ / 2;
                 if (g_sbIcons[i]) g_sbIcons[i](mem, icx, icy, ic);
             }
-            // Status LED with glow
-            int lx = SB_W / 2, ly = h - FTR_H - 14;
-            GdipRadialGlow(lx, ly, 12, C_GREEN, 30);
+            // Status LED with neon pulse
+            int lx = SB_W / 2, ly = h - FTR_H - 16;
+            GdipRadialGlow(lx, ly, 14, C_GREEN, 35);
             GdipCircle(lx, ly, 4, C_GREEN);
         }
 
-        // ── Header bar (gradient + glow logo) ──
+        // ── Header bar (dark gradient + neon accent line) ──
         {
-            GdipGradientV(0, 0, w, HDR_H, RGB(24, 24, 28), RGB(16, 16, 20));
-            GdipLine(0, HDR_H - 1, w, HDR_H - 1, RGB(34, 38, 36), 1.0f);
-            // Logo "PL" with glow
-            int lx = (SB_W - 28) / 2, ly = (HDR_H - 28) / 2;
-            GdipRadialGlow(lx + 14, ly + 14, 22, C_ACCENT, 25);
-            COLORREF logoBg = RGB(GetRValue(C_ACCENT) / 10 + 14, GetGValue(C_ACCENT) / 10 + 14, GetBValue(C_ACCENT) / 10 + 14);
-            COLORREF logoBrd = RGB(GetRValue(C_ACCENT) / 4 + 22, GetGValue(C_ACCENT) / 4 + 22, GetBValue(C_ACCENT) / 4 + 22);
-            GdipRoundRect(lx, ly, 28, 28, 7, logoBg, logoBrd, 1);
-            SelectObject(mem, g_mFS); SetTextColor(mem, C_ACCENT);
-            TextOutA(mem, lx + 5, ly + 7, "PL", 2);
+            GdipGradientV(0, 0, w, HDR_H, RGB(14, 14, 22), RGB(8, 8, 14));
+            // Neon gradient accent line at bottom of header
+            if (g_d2d) {
+                g_d2d->GradientLine((float)SB_W, (float)(HDR_H - 2), (float)w, 2.0f, C_ACCENT, C_PURPLE);
+            } else {
+                GdipLine(SB_W, HDR_H - 1, w, HDR_H - 1, C_ACCENT, 1.0f);
+            }
+            // Sidebar header separator
+            GdipLine(0, HDR_H - 1, SB_W, HDR_H - 1, RGB(20, 22, 30), 1.0f);
+
+            // Logo "PL" with neon glow
+            int lx = (SB_W - 30) / 2, ly = (HDR_H - 30) / 2;
+            GdipRadialGlow(lx + 15, ly + 15, 24, C_ACCENT, 30);
+            COLORREF logoBg = RGB(GetRValue(C_ACCENT) / 12 + 6, GetGValue(C_ACCENT) / 12 + 6, GetBValue(C_ACCENT) / 12 + 10);
+            COLORREF logoBrd = RGB(GetRValue(C_ACCENT) / 4 + 16, GetGValue(C_ACCENT) / 4 + 16, GetBValue(C_ACCENT) / 4 + 20);
+            GdipRoundRect(lx, ly, 30, 30, 8, logoBg, logoBrd, 1);
+            mFontSmall(); mSetColor(C_ACCENT);
+            mText(mem, lx + 6, ly + 9, "PL", 2);
+
             // Page title
             const char* pageTitle = g_sbItems[g_menuPage < SB_COUNT ? g_menuPage : 0].label;
-            SelectObject(mem, g_mFT); SetTextColor(mem, C_TEXT);
-            TextOutA(mem, SB_W + 14, 13, pageTitle, (int)strlen(pageTitle));
-            // "PACKETLOSS" dim
-            SelectObject(mem, g_mFS); SetTextColor(mem, C_TEXT_VDIM);
-            SIZE ts; GetTextExtentPoint32A(mem, pageTitle, (int)strlen(pageTitle), &ts);
-            TextOutA(mem, SB_W + 14 + ts.cx + 10, 16, "PACKETLOSS", 10);
+            mFontTitle(); mSetColor(C_TEXT);
+            mText(mem, SB_W + 16, 14, pageTitle, (int)strlen(pageTitle));
+
+            // "PACKETLOSS" brand (dim, after page title)
+            mFontSmall(); mSetColor(C_TEXT_VDIM);
+            SIZE ts; mMeasure(mem, pageTitle, (int)strlen(pageTitle), &ts);
+            mText(mem, SB_W + 16 + ts.cx + 12, 18, "PACKETLOSS", 10);
+
             // Version
-            SetTextColor(mem, C_TEXT_VDIM);
-            TextOutA(mem, w - 140, 16, "v1.28.8", 7);
-            // Connected badge (GDI+ enhanced)
+            mSetColor(C_TEXT_VDIM);
+            mText(mem, w - 148, 18, "v1.28.8", 7);
+
+            // CONNECTED badge with neon glow
             const char* conn = "CONNECTED";
-            SIZE cs; GetTextExtentPoint32A(mem, conn, 9, &cs);
-            int bx = w - cs.cx - 22;
-            COLORREF cbg2 = RGB(GetRValue(C_GREEN) / 14 + 14, GetGValue(C_GREEN) / 14 + 14, GetBValue(C_GREEN) / 14 + 14);
-            COLORREF cbrd = RGB(GetRValue(C_GREEN) / 6 + 22, GetGValue(C_GREEN) / 6 + 22, GetBValue(C_GREEN) / 6 + 22);
-            GdipRoundRect(bx, 12, cs.cx + 14, cs.cy + 4, 4, cbg2, cbrd, 1);
-            GdipRadialGlow(bx + (cs.cx + 14) / 2, 12 + (cs.cy + 4) / 2, 20, C_GREEN, 10);
-            SetTextColor(mem, C_GREEN);
-            TextOutA(mem, bx + 7, 14, conn, 9);
+            mFontSmall();
+            SIZE cs; mMeasure(mem, conn, 9, &cs);
+            int bx = w - cs.cx - 24;
+            COLORREF cbg2 = RGB(GetRValue(C_GREEN) / 16 + 6, GetGValue(C_GREEN) / 16 + 6, GetBValue(C_GREEN) / 16 + 10);
+            COLORREF cbrd = RGB(GetRValue(C_GREEN) / 5 + 16, GetGValue(C_GREEN) / 5 + 16, GetBValue(C_GREEN) / 5 + 20);
+            GdipRoundRect(bx, 14, cs.cx + 16, cs.cy + 6, 5, cbg2, cbrd, 1);
+            GdipRadialGlow(bx + (cs.cx + 16) / 2, 14 + (cs.cy + 6) / 2, 22, C_GREEN, 12);
+            mSetColor(C_GREEN);
+            mText(mem, bx + 8, 16, conn, 9);
         }
 
         // ── Content area (with clip) ──
         {
-            HRGN clipRgn = CreateRectRgn(CONT_L, CONT_T, w, h - FTR_H);
-            SelectClipRgn(mem, clipRgn);
+            if (g_d2d) g_d2d->PushClip((float)CONT_L, (float)CONT_T, (float)(w - CONT_L), (float)(h - CONT_T - FTR_H));
+            else {
+                HRGN clipRgn = CreateRectRgn(CONT_L, CONT_T, w, h - FTR_H);
+                SelectClipRgn(mem, clipRgn);
+                DeleteObject(clipRgn);
+            }
 
             int totalH = 0;
             if (g_menuPage == 0) totalH = DrawVisualsPage(mem, g_scrollY);
@@ -5337,116 +5427,143 @@ static LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             else if (g_menuPage == 3) totalH = DrawFilterPage(mem, g_scrollY);
             else if (g_menuPage == 4) totalH = DrawExploitsPage(mem, g_scrollY);
             else if (g_menuPage == 5) totalH = DrawConfigPage(mem, g_scrollY);
-            // Note: Config is accessed via page 4 in old code, but we have 5 pages now
-            // Let me map: 0=Visuals, 1=Aimbot, 2=Radar, 3=Filter, 4=Exploits
-            // Config needs to be page 5? Or replace Exploits... Actually let me handle this.
-            // For now, let's keep 5 sidebar items as defined.
 
             g_contentH = totalH;
 
-            // Scrollbar indicator (thin bar on right edge)
+            // Scrollbar indicator (neon thin bar)
             if (totalH > CONT_VH) {
                 int maxScrl = totalH - CONT_VH;
                 int sbHeight = CONT_VH * CONT_VH / totalH;
                 if (sbHeight < 20) sbHeight = 20;
                 int sbY = CONT_T + (g_scrollY * (CONT_VH - sbHeight)) / maxScrl;
-                HBRUSH sbBr2 = CreateSolidBrush(RGB(40, 38, 55));
-                RECT sbRect = { w - 4, sbY, w - 1, sbY + sbHeight };
-                FillRect(mem, &sbRect, sbBr2); DeleteObject(sbBr2);
+                mFillRect(mem, w - 4, sbY, 3, sbHeight, RGB(30, 50, 80));
             }
 
-            SelectClipRgn(mem, NULL);
-            DeleteObject(clipRgn);
+            if (g_d2d) g_d2d->PopClip();
+            else SelectClipRgn(mem, NULL);
         }
 
-        // ── Floating Color Wheel Overlay (renders on ANY page) ──
+        // ── Floating Color Wheel Overlay ──
         if (g_colorPickerOpen >= 0 && g_colorPickerOpen < 16) {
+            // Color wheel still uses GDI bitmap for pixel data — render it via D2D bitmap if possible
             EnsureWheel(mem);
-            if (g_wheelBmp) {
-
-                const char* colorLabels[] = { "Player Box", "Zombie Box", "Snap Lines", "Bones", "Head Dot",
-                    "Weapons","Ammo/Mags","Medical","Food/Drink","Clothing","Backpacks","Attachments","Tools","Other","FOV Circle","Tracers" };
-                // Overlay panel position: centered in content area
-                int panW = WHEEL_R * 2 + 60, panH = WHEEL_R * 2 + 70;
-                int panX = CONT_L + (CONT_W - panW) / 2;
-                int panY = CONT_T + (CONT_VH - panH) / 2;
-                // Dark overlay backdrop
-                HBRUSH dimBr = CreateSolidBrush(RGB(5, 4, 10));
-                RECT dimR = { CONT_L, CONT_T, w, h - FTR_H };
-                FillRect(mem, &dimR, dimBr); DeleteObject(dimBr);
-                // Panel card
-                HBRUSH panBg = CreateSolidBrush(C_CARD);
-                HPEN panPn = CreatePen(PS_SOLID, 1, C_ACCENT);
-                SelectObject(mem, panBg); SelectObject(mem, panPn);
-                RoundRect(mem, panX, panY, panX + panW, panY + panH, CARD_R, CARD_R);
-                DeleteObject(panBg); DeleteObject(panPn);
-                // Header
-                SelectObject(mem, g_mFB); SetTextColor(mem, C_TEXT);
-                char pickHdr[48]; snprintf(pickHdr, sizeof(pickHdr), "Pick: %s", colorLabels[g_colorPickerOpen]);
-                TextOutA(mem, panX + 16, panY + 10, pickHdr, (int)strlen(pickHdr));
-                // Close X button
-                SelectObject(mem, g_mF); SetTextColor(mem, RGB(245, 85, 85));
-                TextOutA(mem, panX + panW - 24, panY + 10, "X", 1);
-                HitZone hzClose; hzClose.r = { panX + panW - 30, panY + 4, panX + panW - 4, panY + 28 };
-                hzClose.type = 4; hzClose.toggle = nullptr; hzClose.idx = g_colorPickerOpen; hzClose.sval = nullptr;
-                g_hz.push_back(hzClose); // clicking X toggles picker closed (same idx = close)
-                // Wheel
-                int wcx = panX + panW / 2, wcy = panY + 38 + WHEEL_R;
+            const char* colorLabels[] = { "Player Box", "Zombie Box", "Snap Lines", "Bones", "Head Dot",
+                "Weapons","Ammo/Mags","Medical","Food/Drink","Clothing","Backpacks","Attachments","Tools","Other","FOV Circle","Tracers" };
+            int panW = WHEEL_R * 2 + 60, panH = WHEEL_R * 2 + 80;
+            int panX = CONT_L + (CONT_W - panW) / 2;
+            int panY = CONT_T + (CONT_VH - panH) / 2;
+            // Dim backdrop
+            mFillRect(mem, CONT_L, CONT_T, w - CONT_L, h - CONT_T - FTR_H, RGB(4, 4, 8));
+            // Panel with accent border
+            GdipRoundRect(panX, panY, panW, panH, CARD_R, C_CARD, C_ACCENT, 1);
+            // Header
+            mFontBold(); mSetColor(C_TEXT);
+            char pickHdr[48]; snprintf(pickHdr, sizeof(pickHdr), "Pick: %s", colorLabels[g_colorPickerOpen]);
+            mText(mem, panX + 16, panY + 12, pickHdr, (int)strlen(pickHdr));
+            // Close X
+            mFontNorm(); mSetColor(RGB(255, 50, 80));
+            mText(mem, panX + panW - 26, panY + 12, "X", 1);
+            HitZone hzClose; hzClose.r = { panX + panW - 30, panY + 4, panX + panW - 4, panY + 30 };
+            hzClose.type = 4; hzClose.toggle = nullptr; hzClose.idx = g_colorPickerOpen; hzClose.sval = nullptr;
+            g_hz.push_back(hzClose);
+            // Wheel — render via GDI BitBlt into a temp DC, then blit to window
+            int wcx = panX + panW / 2, wcy = panY + 42 + WHEEL_R;
+            if (g_wheelBmp && !g_d2d) {
                 HDC wdc = CreateCompatibleDC(mem);
                 SelectObject(wdc, g_wheelBmp);
                 BitBlt(mem, wcx - WHEEL_R, wcy - WHEEL_R, WHEEL_R * 2, WHEEL_R * 2, wdc, 0, 0, SRCCOPY);
                 DeleteDC(wdc);
-                // Wheel border
-                HPEN rp = CreatePen(PS_SOLID, 1, RGB(50, 52, 54));
+            }
+            else if (g_wheelBmp && g_d2d) {
+                // Create D2D bitmap from the GDI wheel bitmap pixels
+                BITMAP bm; GetObject(g_wheelBmp, sizeof(bm), &bm);
+                int d = WHEEL_R * 2;
+                BITMAPINFO bmi2 = {}; bmi2.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi2.bmiHeader.biWidth = d; bmi2.bmiHeader.biHeight = -d;
+                bmi2.bmiHeader.biPlanes = 1; bmi2.bmiHeader.biBitCount = 32;
+                unsigned char* px = new unsigned char[d * d * 4];
+                HDC tmpDC = GetDC(nullptr);
+                GetDIBits(tmpDC, g_wheelBmp, 0, d, px, &bmi2, DIB_RGB_COLORS);
+                ReleaseDC(nullptr, tmpDC);
+                // Swap B/R for D2D (BGRA → BGRA is already correct for D2D)
+                ComPtr<ID2D1Bitmap> wheelBmp;
+                D2D1_BITMAP_PROPERTIES bp2 = {};
+                bp2.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                bp2.dpiX = 96.0f; bp2.dpiY = 96.0f;
+                g_d2d->dc->CreateBitmap(D2D1::SizeU(d, d), px, d * 4, bp2, &wheelBmp);
+                if (wheelBmp) {
+                    g_d2d->dc->DrawBitmap(wheelBmp.Get(),
+                        D2D1::RectF((float)(wcx - WHEEL_R), (float)(wcy - WHEEL_R),
+                            (float)(wcx + WHEEL_R), (float)(wcy + WHEEL_R)));
+                }
+                delete[] px;
+            }
+            // Wheel border
+            if (g_d2d) g_d2d->DrawCircle((float)wcx, (float)wcy, (float)WHEEL_R, RGB(40, 42, 52), 1.0f);
+            else {
+                HPEN rp = CreatePen(PS_SOLID, 1, RGB(40, 42, 52));
                 SelectObject(mem, rp); SelectObject(mem, GetStockObject(NULL_BRUSH));
                 Ellipse(mem, wcx - WHEEL_R, wcy - WHEEL_R, wcx + WHEEL_R, wcy + WHEEL_R);
                 DeleteObject(rp);
-                // Current color indicator
-                COLORREF* curColor = GetColorPtr(g_colorPickerOpen);
-                if (curColor) {
-                    float ch2, cs2;
-                    RGBtoHS(*curColor, ch2, cs2);
-                    float ang = (ch2 - 180.f) * 0.0174533f;
-                    float rad = cs2 * (WHEEL_R - 2.f);
-                    int ix2 = wcx + (int)(cosf(ang) * rad), iy2 = wcy + (int)(sinf(ang) * rad);
+            }
+            // Current color indicator
+            COLORREF* curColor = GetColorPtr(g_colorPickerOpen);
+            if (curColor) {
+                float ch2, cs2;
+                RGBtoHS(*curColor, ch2, cs2);
+                float ang = (ch2 - 180.f) * 0.0174533f;
+                float rad = cs2 * (WHEEL_R - 2.f);
+                int ix2 = wcx + (int)(cosf(ang) * rad), iy2 = wcy + (int)(sinf(ang) * rad);
+                if (g_d2d) {
+                    g_d2d->DrawCircle((float)ix2, (float)iy2, 5.0f, RGB(255, 255, 255), 2.0f);
+                    g_d2d->DrawCircle((float)ix2, (float)iy2, 4.0f, RGB(0, 0, 0), 1.0f);
+                } else {
                     HPEN ip = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
                     SelectObject(mem, ip); Ellipse(mem, ix2 - 5, iy2 - 5, ix2 + 5, iy2 + 5); DeleteObject(ip);
                     HPEN ip2 = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
                     SelectObject(mem, ip2); Ellipse(mem, ix2 - 4, iy2 - 4, ix2 + 4, iy2 + 4); DeleteObject(ip2);
-                    // Current swatch preview at bottom
-                    int swX = panX + 16, swY2 = panY + panH - 22;
-                    HBRUSH swBr = CreateSolidBrush(*curColor);
-                    RECT swR = { swX, swY2, swX + panW - 32, swY2 + 14 }; FillRect(mem, &swR, swBr); DeleteObject(swBr);
-                    HPEN swP = CreatePen(PS_SOLID, 1, RGB(50, 52, 54));
-                    SelectObject(mem, swP); SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    RoundRect(mem, swX, swY2, swX + panW - 32, swY2 + 14, 3, 3); DeleteObject(swP);
                 }
-                // Hit zone for wheel click
-                HitZone hzWheel; hzWheel.r = { wcx - WHEEL_R, wcy - WHEEL_R, wcx + WHEEL_R, wcy + WHEEL_R };
-                hzWheel.type = 9; hzWheel.toggle = nullptr; hzWheel.idx = g_colorPickerOpen;
-                hzWheel.sval = nullptr; hzWheel.slo = (float)wcx; hzWheel.shi = (float)wcy; hzWheel.sstep = 0;
-                g_hz.push_back(hzWheel);
+                // Swatch preview
+                int swX = panX + 16, swY2 = panY + panH - 24;
+                mFillRect(mem, swX, swY2, panW - 32, 16, *curColor);
+                mRoundRect(mem, swX, swY2, panW - 32, 16, 3, *curColor, RGB(40, 42, 52), 1);
             }
+            // Wheel hit zone
+            HitZone hzWheel; hzWheel.r = { wcx - WHEEL_R, wcy - WHEEL_R, wcx + WHEEL_R, wcy + WHEEL_R };
+            hzWheel.type = 9; hzWheel.toggle = nullptr; hzWheel.idx = g_colorPickerOpen;
+            hzWheel.sval = nullptr; hzWheel.slo = (float)wcx; hzWheel.shi = (float)wcy; hzWheel.sstep = 0;
+            g_hz.push_back(hzWheel);
         }
 
-        // ── Footer (gradient) ──
+        // ── Footer (gradient with neon accent) ──
         {
             int fy = h - FTR_H;
-            GdipGradientV(0, fy, w, FTR_H, RGB(14, 14, 17), RGB(10, 10, 12));
-            GdipLine(0, fy, w, fy, RGB(26, 24, 40), 1.0f);
-            SelectObject(mem, g_mFS); SetTextColor(mem, C_TEXT_VDIM);
-            TextOutA(mem, SB_W + 10, fy + 8, "INS toggle  |  DayZ 1.28", 24);
+            GdipGradientV(0, fy, w, FTR_H, RGB(10, 10, 16), RGB(6, 6, 10));
+            // Subtle accent line at top of footer
+            if (g_d2d) g_d2d->GradientLine((float)SB_W, (float)fy, (float)w, 1.0f, C_PURPLE, C_ACCENT);
+            else GdipLine(0, fy, w, fy, RGB(20, 18, 30), 1.0f);
+            mFontSmall(); mSetColor(C_TEXT_VDIM);
+            mText(mem, SB_W + 12, fy + 7, "INS toggle  |  DayZ 1.28", 24);
             char sb[80]; snprintf(sb, sizeof(sb), "%d hits", g_totalHits);
-            SIZE ss; GetTextExtentPoint32A(mem, sb, (int)strlen(sb), &ss);
-            TextOutA(mem, w - ss.cx - 10, fy + 8, sb, (int)strlen(sb));
+            SIZE ss; mMeasure(mem, sb, (int)strlen(sb), &ss);
+            mText(mem, w - ss.cx - 12, fy + 7, sb, (int)strlen(sb));
         }
 
-        // ── Cleanup GDI+ for this frame ──
-        g_gfx = nullptr;
-
-        BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, ob); DeleteObject(mbitmap); DeleteDC(mem);
-        EndPaint(hwnd, &ps); return 0;
+        // ── Present frame ──
+        if (g_d2d) {
+            g_d2d = nullptr;
+            g_menuD2D.Present(1); // vsync = 1 for smooth 60fps
+        }
+        else {
+            // GDI+ fallback: BitBlt to screen
+            g_gfx = nullptr;
+            if (gfxPtr) { delete gfxPtr; gfxPtr = nullptr; }
+            HDC hdc2 = GetDC(hwnd);
+            BitBlt(hdc2, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+            ReleaseDC(hwnd, hdc2);
+            SelectObject(mem, ob); DeleteObject(mbitmap); DeleteDC(mem);
+        }
+        return 0;
     }
     case WM_DESTROY:
         UnregisterHotKey(hwnd, 100);
@@ -5474,13 +5591,18 @@ void ShowMenu(int dayzid) {
     g_mFS = CreateFontA(12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
     g_mFT = CreateFontA(17, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
 
-    g_menuHwnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_LAYERED, "CompassionV5", "", WS_POPUP,
+    g_menuHwnd = CreateWindowExA(WS_EX_TOPMOST, "CompassionV5", "", WS_POPUP,
         40, 40, MW, MH, nullptr, nullptr, hi, nullptr);
     if (!g_menuHwnd) return;
     // Rounded window corners
     HRGN rgn = CreateRoundRectRgn(0, 0, MW + 1, MH + 1, 16, 16);
     SetWindowRgn(g_menuHwnd, rgn, TRUE);
-    SetLayeredWindowAttributes(g_menuHwnd, 0, 242, LWA_ALPHA);
+
+    // Initialize Direct2D for the menu window (falls back to GDI+ if this fails)
+    if (!g_menuD2D.InitForHwnd(g_menuHwnd, MW, MH)) {
+        printf("[!] Menu D2D init failed, falling back to GDI+\n");
+    }
+
     ShowWindow(g_menuHwnd, SW_SHOW); UpdateWindow(g_menuHwnd);
 
     MSG msg{};
@@ -5495,6 +5617,7 @@ void ShowMenu(int dayzid) {
         Sleep(33);
     }
 ex: StopAll();
+    g_menuD2D.Shutdown();
     if (g_menuHwnd) { DestroyWindow(g_menuHwnd); g_menuHwnd = nullptr; }
 }
 

@@ -1,8 +1,8 @@
 #pragma once
 // ═══════════════════════════════════════════════════════════════
 //  Direct2D / DirectWrite Overlay Renderer
-//  Hardware-accelerated transparent overlay via D3D11 + DComposition
-//  Replaces GDI/GDI+ rendering for the ESP overlay
+//  Hardware-accelerated rendering via D3D11 + DComposition / SwapChain
+//  Used for both the ESP overlay (DComp) and the menu window (HWND)
 // ═══════════════════════════════════════════════════════════════
 
 #include <d3d11.h>
@@ -47,6 +47,14 @@ public:
     ComPtr<IDWriteTextFormat>   fontRadarLabel; // 11pt semibold, radar labels
     ComPtr<IDWriteTextFormat>   fontHitHeader;  // 14pt semibold, hit feed header
     ComPtr<IDWriteTextFormat>   fontHitBody;    // 11pt, hit feed body
+
+    // ── Menu-specific fonts (created by InitForHwnd) ──
+    ComPtr<IDWriteTextFormat>   fontMenu;       // 14pt Segoe UI, menu normal
+    ComPtr<IDWriteTextFormat>   fontMenuBold;   // 14pt Segoe UI Semibold, menu bold
+    ComPtr<IDWriteTextFormat>   fontMenuSmall;  // 11pt Segoe UI, menu small
+    ComPtr<IDWriteTextFormat>   fontMenuTitle;  // 17pt Segoe UI Bold, page titles
+    ComPtr<IDWriteTextFormat>   fontMenuSub;    // 12pt Segoe UI Semibold, card headers
+    ComPtr<IDWriteTextFormat>   fontMenuHeader; // 22pt Segoe UI Light, brand header
 
     // ── DComposition ──
     ComPtr<IDCompositionDevice>  dcompDevice;
@@ -173,6 +181,82 @@ public:
     }
 
     // ════════════════════════════════════════
+    //  INIT FOR HWND (Menu window — D3D11 swap chain, no DComposition)
+    //  Renders directly to an existing HWND via swap chain
+    // ════════════════════════════════════════
+
+    bool InitForHwnd(HWND targetHwnd, int w, int h) {
+        hwnd = targetHwnd;
+        width = w; height = h;
+        HRESULT hr;
+
+        // 1. D3D11 device with BGRA support
+        D3D_FEATURE_LEVEL featureLevel;
+        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            nullptr, 0, D3D11_SDK_VERSION, &d3dDevice, &featureLevel, nullptr);
+        if (FAILED(hr)) return false;
+
+        // 2. DXGI device
+        ComPtr<IDXGIDevice> dxgiDevice;
+        d3dDevice.As(&dxgiDevice);
+
+        // 3. D2D1 factory
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            __uuidof(ID2D1Factory1), nullptr, (void**)d2dFactory.GetAddressOf());
+        if (FAILED(hr)) return false;
+
+        // 4. D2D1 device
+        hr = d2dFactory->CreateDevice(dxgiDevice.Get(), &d2dDevice);
+        if (FAILED(hr)) return false;
+
+        // 5. D2D1 device context
+        hr = d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc);
+        if (FAILED(hr)) return false;
+
+        // 6. Swap chain for HWND (opaque — no per-pixel alpha needed for menu)
+        DXGI_SWAP_CHAIN_DESC1 scd = {};
+        scd.Width = width;
+        scd.Height = height;
+        scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.SampleDesc.Count = 1;
+        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.BufferCount = 2;
+        scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        scd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+        ComPtr<IDXGIFactory2> dxgiFactory;
+        ComPtr<IDXGIAdapter> dxgiAdapter;
+        dxgiDevice->GetAdapter(&dxgiAdapter);
+        dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), (void**)&dxgiFactory);
+
+        hr = dxgiFactory->CreateSwapChainForHwnd(d3dDevice.Get(), hwnd, &scd, nullptr, nullptr, &swapChain);
+        if (FAILED(hr)) return false;
+
+        // 7. Bitmap target from swap chain
+        if (!CreateTargetBitmap()) return false;
+
+        // 8. Rendering settings
+        dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+
+        // 9. Reusable brush
+        dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &brush);
+
+        // 10. DirectWrite
+        hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory), (IUnknown**)dwFactory.GetAddressOf());
+        if (FAILED(hr)) return false;
+
+        // 11. Fonts (ESP + menu)
+        CreateFonts();
+        CreateMenuFonts();
+
+        initialized = true;
+        return true;
+    }
+
+    // ════════════════════════════════════════
     //  FRAME MANAGEMENT
     // ════════════════════════════════════════
 
@@ -180,6 +264,14 @@ public:
         if (!initialized) return false;
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0)); // fully transparent
+        return true;
+    }
+
+    // Begin frame with opaque background (for menu window)
+    bool BeginFrameOpaque(COLORREF bg) {
+        if (!initialized) return false;
+        dc->BeginDraw();
+        dc->Clear(Col(bg));
         return true;
     }
 
@@ -192,6 +284,27 @@ public:
         }
         DXGI_PRESENT_PARAMETERS pp = {};
         swapChain->Present1(0, 0, &pp);
+    }
+
+    // Present with vsync control (menu uses vsync=1 for smoothness)
+    void Present(int vsync = 1) {
+        HRESULT hr = dc->EndDraw();
+        if (hr == D2DERR_RECREATE_TARGET) {
+            CreateTargetBitmap();
+            return;
+        }
+        DXGI_PRESENT_PARAMETERS pp = {};
+        swapChain->Present1(vsync, 0, &pp);
+    }
+
+    // Resize swap chain (call on WM_SIZE)
+    void Resize(int newW, int newH) {
+        if (!initialized || !swapChain) return;
+        width = newW; height = newH;
+        dc->SetTarget(nullptr);
+        targetBitmap.Reset();
+        swapChain->ResizeBuffers(0, newW, newH, DXGI_FORMAT_UNKNOWN, 0);
+        CreateTargetBitmap();
     }
 
     // ════════════════════════════════════════
@@ -470,6 +583,73 @@ public:
         Text(str, len, x, y, c, font, a);
     }
 
+    // ── Text with word wrapping (for descriptions) — returns height used ──
+    float TextWrapped(const char* str, float x, float y, float maxW, COLORREF c, IDWriteTextFormat* font = nullptr, float a = 1.0f) {
+        if (!str) return 0;
+        int len = (int)strlen(str);
+        if (len <= 0) return 0;
+        if (!font) font = fontMenu.Get() ? fontMenu.Get() : fontESP.Get();
+
+        int wlen = MultiByteToWideChar(CP_ACP, 0, str, len, nullptr, 0);
+        wchar_t wbuf[512];
+        if (wlen > 511) wlen = 511;
+        MultiByteToWideChar(CP_ACP, 0, str, len, wbuf, wlen);
+        wbuf[wlen] = 0;
+
+        ComPtr<IDWriteTextLayout> layout;
+        dwFactory->CreateTextLayout(wbuf, wlen, font, maxW, 200.0f, &layout);
+        DWRITE_TEXT_METRICS metrics;
+        layout->GetMetrics(&metrics);
+
+        SetBrush(c, a);
+        dc->DrawTextLayout({ x, y }, layout.Get(), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_NO_SNAP);
+        return metrics.height;
+    }
+
+    // ── 3-stop vertical gradient (for header accent bars) ──
+    void Gradient3V(float x, float y, float w, float h, COLORREF c1, COLORREF c2, COLORREF c3) {
+        D2D1_GRADIENT_STOP stops[3] = {
+            { 0.0f, Col(c1) }, { 0.5f, Col(c2) }, { 1.0f, Col(c3) }
+        };
+        ComPtr<ID2D1GradientStopCollection> sc;
+        dc->CreateGradientStopCollection(stops, 3, &sc);
+        ComPtr<ID2D1LinearGradientBrush> gb;
+        dc->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties({ x, y }, { x + w, y }), sc.Get(), &gb);
+        dc->FillRectangle(D2D1::RectF(x, y, x + w, y + h), gb.Get());
+    }
+
+    // ── Neon line (line with soft glow halo) ──
+    void NeonLine(float x1, float y1, float x2, float y2, COLORREF c, float w = 2.0f) {
+        // Outer glow
+        SetBrush(c, 0.08f);
+        dc->DrawLine({ x1, y1 }, { x2, y2 }, brush.Get(), w + 8.0f);
+        SetBrush(c, 0.15f);
+        dc->DrawLine({ x1, y1 }, { x2, y2 }, brush.Get(), w + 4.0f);
+        SetBrush(c, 0.3f);
+        dc->DrawLine({ x1, y1 }, { x2, y2 }, brush.Get(), w + 2.0f);
+        // Core
+        SetBrush(c, 1.0f);
+        dc->DrawLine({ x1, y1 }, { x2, y2 }, brush.Get(), w);
+    }
+
+    // ── Gradient horizontal line (accent bar) ──
+    void GradientLine(float x1, float y, float x2, float h, COLORREF left, COLORREF right) {
+        D2D1_GRADIENT_STOP stops[2] = { {0.0f, Col(left)}, {1.0f, Col(right)} };
+        ComPtr<ID2D1GradientStopCollection> sc;
+        dc->CreateGradientStopCollection(stops, 2, &sc);
+        ComPtr<ID2D1LinearGradientBrush> gb;
+        dc->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties({ x1, y }, { x2, y }), sc.Get(), &gb);
+        dc->FillRectangle(D2D1::RectF(x1, y, x2, y + h), gb.Get());
+    }
+
+    // ── Push/Pop axis-aligned clip ──
+    void PushClip(float x, float y, float w, float h) {
+        dc->PushAxisAlignedClip(D2D1::RectF(x, y, x + w, y + h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    }
+    void PopClip() { dc->PopAxisAlignedClip(); }
+
 private:
     bool CreateTargetBitmap() {
         ComPtr<IDXGISurface> dxgiSurface;
@@ -534,5 +714,44 @@ private:
         if (fontRadarLabel) fontRadarLabel->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         if (fontHitHeader) fontHitHeader->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         if (fontHitBody) fontHitBody->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+
+    void CreateMenuFonts() {
+        // Menu normal (14pt Segoe UI)
+        dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &fontMenu);
+
+        // Menu bold (14pt Segoe UI Semibold)
+        dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &fontMenuBold);
+
+        // Menu small (11pt Segoe UI)
+        dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us", &fontMenuSmall);
+
+        // Menu title (17pt Segoe UI Bold)
+        dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 17.0f, L"en-us", &fontMenuTitle);
+
+        // Menu sub (12pt Segoe UI Semibold)
+        dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &fontMenuSub);
+
+        // Menu header/brand (22pt Segoe UI Light)
+        dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_LIGHT, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 22.0f, L"en-us", &fontMenuHeader);
+
+        // Set alignment
+        IDWriteTextFormat* menuFonts[] = { fontMenu.Get(), fontMenuBold.Get(), fontMenuSmall.Get(),
+            fontMenuTitle.Get(), fontMenuSub.Get(), fontMenuHeader.Get() };
+        for (auto* f : menuFonts) {
+            if (f) f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
     }
 };
