@@ -19,7 +19,6 @@
 #include <cstdint>
 #include "offsets.h"
 #include "math.h"
-#include "d3d11.h"
 #include <cstdio>
 #include <tchar.h>
 #include <string>
@@ -48,6 +47,11 @@ static ULONG_PTR g_gdipToken = 0;
 
 #include <dwmapi.h>
 #pragma comment(lib, "Dwmapi.lib")
+
+// ── Direct2D / DirectWrite overlay renderer (hardware-accelerated ESP) ──
+#include "d2d_renderer.h"
+static D2DOverlay g_espOverlay;                       // ESP overlay D2D instance
+static thread_local D2DOverlay* g_d2d = nullptr;      // per-thread D2D pointer (set during ESP render)
 
 // ═══ DEBUG: Crash handler — keeps console open on crash ═══
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
@@ -1697,7 +1701,8 @@ static LRESULT CALLBACK RadarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  GDI+ RENDERING HELPERS — antialiased, gradient, glow
+//  RENDERING HELPERS — dual-path: Direct2D (g_d2d) or GDI+ (g_gfx)
+//  D2D is used for ESP overlay, GDI+ is used for the menu window
 // ═══════════════════════════════════════════════════════════════
 static thread_local Gdiplus::Graphics* g_gfx = nullptr; // per-thread, set each frame in WM_PAINT / ESP
 
@@ -1707,6 +1712,7 @@ static inline Gdiplus::Color GdipCol(COLORREF c, BYTE a = 255) {
 
 // Antialiased filled + stroked rounded rect
 static void GdipRoundRect(int x, int y, int w, int h, int r, COLORREF fill, COLORREF stroke, int strokeW = 1) {
+    if (g_d2d) { g_d2d->RoundRect((float)x, (float)y, (float)w, (float)h, (float)r, fill, stroke, (float)strokeW); return; }
     if (!g_gfx) return;
     Gdiplus::GraphicsPath path;
     int d = r * 2;
@@ -1725,6 +1731,7 @@ static void GdipRoundRect(int x, int y, int w, int h, int r, COLORREF fill, COLO
 
 // Vertical gradient rounded rect
 static void GdipGradientRoundRect(int x, int y, int w, int h, int r, COLORREF top, COLORREF bot, COLORREF stroke = 0, int strokeW = 0) {
+    if (g_d2d) { g_d2d->GradientRoundRect((float)x, (float)y, (float)w, (float)h, (float)r, top, bot, stroke, (float)strokeW); return; }
     if (!g_gfx) return;
     Gdiplus::GraphicsPath path;
     int d = r * 2;
@@ -1743,6 +1750,7 @@ static void GdipGradientRoundRect(int x, int y, int w, int h, int r, COLORREF to
 
 // Glow effect: multiple expanded rounded rects with decreasing alpha
 static void GdipGlow(int x, int y, int w, int h, int r, COLORREF color, int spread = 6, BYTE peakAlpha = 30) {
+    if (g_d2d) { g_d2d->Glow((float)x, (float)y, (float)w, (float)h, (float)r, color, spread, peakAlpha / 255.0f); return; }
     if (!g_gfx) return;
     for (int i = spread; i > 0; i--) {
         BYTE a = (BYTE)(peakAlpha * (spread - i + 1) / spread);
@@ -1761,6 +1769,7 @@ static void GdipGlow(int x, int y, int w, int h, int r, COLORREF color, int spre
 
 // Antialiased filled pill (capsule)
 static void GdipPill(int x, int y, int w, int h, COLORREF fill) {
+    if (g_d2d) { g_d2d->Pill((float)x, (float)y, (float)w, (float)h, fill); return; }
     if (!g_gfx) return;
     Gdiplus::GraphicsPath path;
     int r = h;
@@ -1773,6 +1782,7 @@ static void GdipPill(int x, int y, int w, int h, COLORREF fill) {
 
 // Antialiased filled circle
 static void GdipCircle(int cx, int cy, int r, COLORREF fill, COLORREF border = 0, int borderW = 0) {
+    if (g_d2d) { g_d2d->Circle((float)cx, (float)cy, (float)r, fill, border, (float)borderW); return; }
     if (!g_gfx) return;
     Gdiplus::SolidBrush fb(GdipCol(fill));
     g_gfx->FillEllipse(&fb, cx - r, cy - r, r * 2, r * 2);
@@ -1784,6 +1794,7 @@ static void GdipCircle(int cx, int cy, int r, COLORREF fill, COLORREF border = 0
 
 // Antialiased line
 static void GdipLine(int x1, int y1, int x2, int y2, COLORREF color, float width = 1.0f) {
+    if (g_d2d) { g_d2d->Line((float)x1, (float)y1, (float)x2, (float)y2, color, width); return; }
     if (!g_gfx) return;
     Gdiplus::Pen p(GdipCol(color), width);
     g_gfx->DrawLine(&p, x1, y1, x2, y2);
@@ -1791,6 +1802,7 @@ static void GdipLine(int x1, int y1, int x2, int y2, COLORREF color, float width
 
 // Horizontal gradient (for sidebar or header)
 static void GdipGradientH(int x, int y, int w, int h, COLORREF left, COLORREF right) {
+    if (g_d2d) { g_d2d->GradientH((float)x, (float)y, (float)w, (float)h, left, right); return; }
     if (!g_gfx) return;
     Gdiplus::LinearGradientBrush gb(Gdiplus::Point(x, y), Gdiplus::Point(x + w, y), GdipCol(left), GdipCol(right));
     g_gfx->FillRectangle(&gb, x, y, w, h);
@@ -1798,6 +1810,7 @@ static void GdipGradientH(int x, int y, int w, int h, COLORREF left, COLORREF ri
 
 // Vertical gradient (for sidebar or header)
 static void GdipGradientV(int x, int y, int w, int h, COLORREF top, COLORREF bot) {
+    if (g_d2d) { g_d2d->GradientV((float)x, (float)y, (float)w, (float)h, top, bot); return; }
     if (!g_gfx) return;
     Gdiplus::LinearGradientBrush gb(Gdiplus::Point(x, y), Gdiplus::Point(x, y + h), GdipCol(top), GdipCol(bot));
     g_gfx->FillRectangle(&gb, x, y, w, h);
@@ -1805,6 +1818,7 @@ static void GdipGradientV(int x, int y, int w, int h, COLORREF top, COLORREF bot
 
 // Radial glow at a point (for logo, LEDs, active indicators)
 static void GdipRadialGlow(int cx, int cy, int r, COLORREF color, BYTE peakAlpha = 50) {
+    if (g_d2d) { g_d2d->RadialGlow((float)cx, (float)cy, (float)r, color, peakAlpha / 255.0f); return; }
     if (!g_gfx) return;
     for (int i = r; i > 0; i -= 2) {
         BYTE a = (BYTE)(peakAlpha * i / r);
@@ -1812,23 +1826,127 @@ static void GdipRadialGlow(int cx, int cy, int r, COLORREF color, BYTE peakAlpha
         g_gfx->FillEllipse(&fb, cx - i, cy - i, i * 2, i * 2);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  ESP TEXT HELPERS — route to D2D when active, GDI otherwise
+// ═══════════════════════════════════════════════════════════════
+static thread_local COLORREF g_espTextCol = RGB(255, 255, 255);
+static thread_local IDWriteTextFormat* g_espFont = nullptr;
+
+static inline void EspSetColor(HDC dc, COLORREF c) {
+    g_espTextCol = c;
+    if (!g_d2d) SetTextColor(dc, c);
+}
+static inline void EspSelectFont(HDC dc, HFONT hf, IDWriteTextFormat* dwf) {
+    g_espFont = dwf;
+    if (!g_d2d) SelectObject(dc, hf);
+}
+static inline void EspTextOut(HDC dc, int x, int y, const char* s, int n) {
+    if (g_d2d) g_d2d->Text(s, n, (float)x, (float)y, g_espTextCol, g_espFont);
+    else TextOutA(dc, x, y, s, n);
+}
+static inline void EspTextOutShadow(HDC dc, int x, int y, const char* s, int n) {
+    if (g_d2d) g_d2d->TextShadow(s, n, (float)x, (float)y, g_espTextCol, g_espFont);
+    else {
+        COLORREF prev = g_espTextCol;
+        SetTextColor(dc, RGB(0, 0, 0));
+        TextOutA(dc, x + 1, y + 1, s, n);
+        SetTextColor(dc, prev);
+        TextOutA(dc, x, y, s, n);
+    }
+}
+static inline void EspMeasure(HDC dc, const char* s, int n, SIZE* out) {
+    if (g_d2d) g_d2d->TextMeasure(s, n, g_espFont, out);
+    else GetTextExtentPoint32A(dc, s, n, out);
+}
+
+// ── ESP GDI shape helpers — route to D2D or GDI ──
+static inline void EspLine(HDC dc, int x1, int y1, int x2, int y2, COLORREF c, float w = 1.0f) {
+    if (g_d2d) { g_d2d->Line((float)x1, (float)y1, (float)x2, (float)y2, c, w); return; }
+    HPEN p = CreatePen(PS_SOLID, (int)w, c); SelectObject(dc, p);
+    MoveToEx(dc, x1, y1, NULL); LineTo(dc, x2, y2); DeleteObject(p);
+}
+static inline void EspEllipse(HDC dc, int x1, int y1, int x2, int y2, COLORREF fill) {
+    if (g_d2d) {
+        float cx = (x1 + x2) / 2.0f, cy = (y1 + y2) / 2.0f;
+        float rx = (x2 - x1) / 2.0f, ry = (y2 - y1) / 2.0f;
+        g_d2d->EllipseFill(cx, cy, rx, ry, fill);
+        return;
+    }
+    HBRUSH b = CreateSolidBrush(fill); SelectObject(dc, b);
+    SelectObject(dc, GetStockObject(NULL_PEN));
+    Ellipse(dc, x1, y1, x2, y2); DeleteObject(b);
+}
+static inline void EspEllipseOutline(HDC dc, int x1, int y1, int x2, int y2, COLORREF stroke, int sw = 1) {
+    if (g_d2d) {
+        float cx = (x1 + x2) / 2.0f, cy = (y1 + y2) / 2.0f;
+        float rx = (x2 - x1) / 2.0f, ry = (y2 - y1) / 2.0f;
+        g_d2d->EllipseOutline(cx, cy, rx, ry, stroke, (float)sw);
+        return;
+    }
+    HPEN p = CreatePen(PS_SOLID, sw, stroke); SelectObject(dc, p);
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Ellipse(dc, x1, y1, x2, y2); DeleteObject(p);
+}
+static inline void EspFillRect(HDC dc, int x, int y, int x2, int y2, COLORREF fill) {
+    if (g_d2d) { g_d2d->FillRect((float)x, (float)y, (float)(x2 - x), (float)(y2 - y), fill); return; }
+    HBRUSH b = CreateSolidBrush(fill); RECT r = { x, y, x2, y2 };
+    FillRect(dc, &r, b); DeleteObject(b);
+}
+static inline void EspRoundRect(HDC dc, int x, int y, int x2, int y2, int rw, int rh, COLORREF fill, COLORREF stroke, int sw = 1) {
+    if (g_d2d) { g_d2d->RoundRect((float)x, (float)y, (float)(x2 - x), (float)(y2 - y), (float)rw / 2.0f, fill, stroke, (float)sw); return; }
+    HBRUSH b = CreateSolidBrush(fill); HPEN p = CreatePen(PS_SOLID, sw, stroke);
+    SelectObject(dc, b); SelectObject(dc, p);
+    ::RoundRect(dc, x, y, x2, y2, rw, rh);
+    DeleteObject(b); DeleteObject(p);
+}
+static inline void EspPolygon(HDC dc, POINT* pts, int count, COLORREF fill, COLORREF stroke = 0, int sw = 1) {
+    if (g_d2d) {
+        D2D1_POINT_2F d2pts[8]; // max 8 verts
+        int cnt = count > 8 ? 8 : count;
+        for (int i = 0; i < cnt; i++) { d2pts[i] = { (float)pts[i].x, (float)pts[i].y }; }
+        if (fill) g_d2d->Polygon(d2pts, cnt, fill, stroke, (float)sw);
+        else g_d2d->DrawPolygon(d2pts, cnt, stroke, (float)sw);
+        return;
+    }
+    HBRUSH b = fill ? CreateSolidBrush(fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
+    HPEN p = CreatePen(PS_SOLID, sw, stroke ? stroke : fill);
+    SelectObject(dc, b); SelectObject(dc, p);
+    ::Polygon(dc, pts, count);
+    if (fill) DeleteObject(b); DeleteObject(p);
+}
 void RunOverlays(int dayzid) {
     printf("[overlay] Single thread started.\n");
     const int SW = 1920, SH = 1080;
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
 
-    // ESP WINDOW
-    WNDCLASSEXA wcE = {}; wcE.cbSize = sizeof(wcE); wcE.lpfnWndProc = DefWindowProcA;
-    wcE.hInstance = GetModuleHandleA(nullptr); wcE.lpszClassName = "ESP_OVL";
-    RegisterClassExA(&wcE);
-    HWND espH = CreateWindowExA(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
-        "ESP_OVL", "", WS_POPUP, 0, 0, SW, SH, nullptr, nullptr, wcE.hInstance, nullptr);
+    // ESP WINDOW — Direct2D hardware-accelerated transparent overlay
+    bool d2dReady = false;
+    if (g_espOverlay.CreateOverlayWindow(SW, SH) && g_espOverlay.Init()) {
+        d2dReady = true;
+        printf("[overlay] Direct2D overlay initialized (D3D11 + DComposition)\n");
+    }
+    else {
+        printf("[overlay] D2D init failed, falling back to GDI+\n");
+    }
+    HWND espH = d2dReady ? g_espOverlay.hwnd : nullptr;
+
+    // GDI fallback window (only if D2D failed)
+    HFONT espF = nullptr, espFItem = nullptr, espFItemDist = nullptr;
+    HFONT espFB = nullptr, espFI = nullptr;
     const COLORREF CLR = RGB(255, 0, 255);
-    SetLayeredWindowAttributes(espH, CLR, 0, LWA_COLORKEY);
-    HFONT espF = CreateFontA(12, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Times New Roman");
-    HFONT espFB = espF; HFONT espFI = espF;
-    HFONT espFItem = CreateFontA(14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-    HFONT espFItemDist = CreateFontA(11, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    if (!d2dReady) {
+        WNDCLASSEXA wcE = {}; wcE.cbSize = sizeof(wcE); wcE.lpfnWndProc = DefWindowProcA;
+        wcE.hInstance = GetModuleHandleA(nullptr); wcE.lpszClassName = "ESP_OVL";
+        RegisterClassExA(&wcE);
+        espH = CreateWindowExA(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+            "ESP_OVL", "", WS_POPUP, 0, 0, SW, SH, nullptr, nullptr, wcE.hInstance, nullptr);
+        SetLayeredWindowAttributes(espH, CLR, 0, LWA_COLORKEY);
+    }
+    espF = CreateFontA(12, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    espFB = espF; espFI = espF;
+    espFItem = CreateFontA(14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    espFItemDist = CreateFontA(11, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
 
     // RADAR WINDOW
     WNDCLASSEXA wcR = {}; wcR.cbSize = sizeof(wcR); wcR.style = CS_HREDRAW | CS_VREDRAW;
@@ -2699,62 +2817,71 @@ void RunOverlays(int dayzid) {
         }
 
         // ══════════════════════════════
-        //  RENDER ESP
+        //  RENDER ESP (Direct2D or GDI+ fallback)
         // ══════════════════════════════
         if (espOn) {
-            HDC hdc = GetDC(espH); HDC mem = CreateCompatibleDC(hdc);
-            HBITMAP bmp = CreateCompatibleBitmap(hdc, SW, SH);
-            SelectObject(mem, bmp); SelectObject(mem, espF);
-            RECT rr = { 0,0,SW,SH }; HBRUSH cb = CreateSolidBrush(CLR); FillRect(mem, &rr, cb); DeleteObject(cb);
-            SetBkMode(mem, TRANSPARENT); SetTextColor(mem, g_colPlayerBox);
-
-            // ── GDI+ overlay rendering (antialiased ESP) ──
-            Gdiplus::Graphics espGfx(mem);
-            espGfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            espGfx.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-            g_gfx = &espGfx;
-
-            // Crosshair (GDI+ antialiased)
-            int cx = SW / 2, cy = SH / 2;
-            if (g_gfx) {
-                Gdiplus::Pen cp(GdipCol(COL_CROSS), 1.0f);
-                g_gfx->DrawLine(&cp, cx - 8, cy, cx - 3, cy);
-                g_gfx->DrawLine(&cp, cx + 3, cy, cx + 8, cy);
-                g_gfx->DrawLine(&cp, cx, cy - 8, cx, cy - 3);
-                g_gfx->DrawLine(&cp, cx, cy + 3, cx, cy + 8);
+            // ── Frame setup: D2D path or GDI fallback ──
+            HDC hdc = nullptr, mem = nullptr;
+            HBITMAP bmp = nullptr;
+            if (d2dReady) {
+                if (!g_espOverlay.BeginFrame()) { Sleep(2); tick++; continue; }
+                g_d2d = &g_espOverlay;
+                g_espFont = g_espOverlay.fontESP.Get();
+                g_espTextCol = g_colPlayerBox;
             }
             else {
-                HPEN crossPen = CreatePen(PS_SOLID, 1, COL_CROSS); SelectObject(mem, crossPen);
-                MoveToEx(mem, cx - 8, cy, NULL); LineTo(mem, cx - 3, cy);
-                MoveToEx(mem, cx + 3, cy, NULL); LineTo(mem, cx + 8, cy);
-                MoveToEx(mem, cx, cy - 8, NULL); LineTo(mem, cx, cy - 3);
-                MoveToEx(mem, cx, cy + 3, NULL); LineTo(mem, cx, cy + 8);
-                DeleteObject(crossPen);
+                hdc = GetDC(espH); mem = CreateCompatibleDC(hdc);
+                bmp = CreateCompatibleBitmap(hdc, SW, SH);
+                SelectObject(mem, bmp); SelectObject(mem, espF);
+                RECT rr = { 0,0,SW,SH }; HBRUSH cb2 = CreateSolidBrush(CLR); ::FillRect(mem, &rr, cb2); DeleteObject(cb2);
+                SetBkMode(mem, TRANSPARENT); SetTextColor(mem, g_colPlayerBox);
+                Gdiplus::Graphics espGfx(mem);
+                espGfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                espGfx.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+                g_gfx = &espGfx;
             }
 
+            // Crosshair — with subtle glow in D2D mode
+            int cx = SW / 2, cy = SH / 2;
+            if (g_d2d) {
+                // Glow behind crosshair
+                g_d2d->RadialGlow((float)cx, (float)cy, 12.0f, COL_CROSS, 0.15f);
+                g_d2d->Line((float)(cx - 8), (float)cy, (float)(cx - 3), (float)cy, COL_CROSS, 1.5f);
+                g_d2d->Line((float)(cx + 3), (float)cy, (float)(cx + 8), (float)cy, COL_CROSS, 1.5f);
+                g_d2d->Line((float)cx, (float)(cy - 8), (float)cx, (float)(cy - 3), COL_CROSS, 1.5f);
+                g_d2d->Line((float)cx, (float)(cy + 3), (float)cx, (float)(cy + 8), COL_CROSS, 1.5f);
+                g_d2d->FillCircle((float)cx, (float)cy, 1.5f, COL_CROSS, 0.8f);
+            }
+            else {
+                GdipLine(cx - 8, cy, cx - 3, cy, COL_CROSS, 1.0f);
+                GdipLine(cx + 3, cy, cx + 8, cy, COL_CROSS, 1.0f);
+                GdipLine(cx, cy - 8, cx, cy - 3, COL_CROSS, 1.0f);
+                GdipLine(cx, cy + 3, cx, cy + 8, COL_CROSS, 1.0f);
+            }
 
-            // ── Hit feed (top-right) ──
+            // ── Hit feed (top-right) with D2D text ──
             if (!g_hitLog.empty()) {
-                SelectObject(mem, espFItem);
+                EspSelectFont(mem, espFItem, d2dReady ? g_espOverlay.fontHitHeader.Get() : nullptr);
                 int hfx = SW - 220, hfy = 30;
-                // Header
                 char hfHdr[48]; snprintf(hfHdr, sizeof(hfHdr), "HITS: %d", g_totalHits);
-                SetTextColor(mem, RGB(255, 60, 60));
-                TextOutA(mem, hfx, hfy, hfHdr, (int)strlen(hfHdr));
+                EspSetColor(mem, RGB(255, 60, 60));
+                EspTextOut(mem, hfx, hfy, hfHdr, (int)strlen(hfHdr));
                 hfy += 18;
-                SelectObject(mem, espFItemDist);
+                EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontHitBody.Get() : nullptr);
                 for (int hi = (int)g_hitLog.size() - 1; hi >= 0; hi--) {
                     HitEntry& he = g_hitLog[hi];
                     int age = tick - he.tick;
-                    if (age > T_10S) continue; // fade after ~10s
+                    if (age > T_10S) continue;
                     int alpha = 255 - age * 255 / T_10S;
                     if (alpha < 40) alpha = 40;
                     char hfLine[64]; snprintf(hfLine, sizeof(hfLine), ">> HIT  %.0fm  [%s]", he.dist, he.bone.c_str());
-                    SetTextColor(mem, RGB(alpha, alpha * 40 / 255, alpha * 40 / 255));
-                    TextOutA(mem, hfx, hfy, hfLine, (int)strlen(hfLine));
+                    EspSetColor(mem, RGB(alpha, alpha * 40 / 255, alpha * 40 / 255));
+                    if (g_d2d) g_d2d->Text(hfLine, (int)strlen(hfLine), (float)hfx, (float)hfy, g_espTextCol, g_espFont, alpha / 255.0f);
+                    else EspTextOut(mem, hfx, hfy, hfLine, (int)strlen(hfLine));
                     hfy += 16;
                 }
-                SelectObject(mem, espF); SetTextColor(mem, g_colPlayerBox);
+                EspSelectFont(mem, espF, d2dReady ? g_espOverlay.fontESP.Get() : nullptr);
+                EspSetColor(mem, g_colPlayerBox);
             }
 
             // ── Bullet tracers ──
@@ -2771,74 +2898,69 @@ void RunOverlays(int dayzid) {
                     // Fade based on age
                     int age = tick - g_tracers[t].lastSeen;
                     BYTE alpha = (BYTE)(std::max)(40, 220 - age * 4);
-                    if (g_gfx) {
+                    float alphaF = alpha / 255.0f;
+                    if (g_d2d) {
+                        g_d2d->Line((float)x1t, (float)y1t, (float)x2t, (float)y2t, g_tracerColor, 1.5f, alphaF);
+                        if (v2) g_d2d->FillCircle((float)x2t, (float)y2t, 2.0f, g_tracerColor, alphaF);
+                    }
+                    else if (g_gfx) {
                         Gdiplus::Pen tp(GdipCol(g_tracerColor, alpha), 1.5f);
                         g_gfx->DrawLine(&tp, x1t, y1t, x2t, y2t);
-                        // Bright head dot at current position
                         if (v2) {
                             Gdiplus::SolidBrush hb(GdipCol(g_tracerColor, alpha));
                             g_gfx->FillEllipse(&hb, x2t - 2, y2t - 2, 4, 4);
                         }
                     }
                     else {
-                        HPEN tp2 = CreatePen(PS_SOLID, 1, g_tracerColor);
-                        SelectObject(mem, tp2);
-                        MoveToEx(mem, x1t, y1t, NULL); LineTo(mem, x2t, y2t);
-                        DeleteObject(tp2);
+                        EspLine(mem, x1t, y1t, x2t, y2t, g_tracerColor);
                     }
                 }
             }
 
-            // FOV circle (GDI+ antialiased)
+            // FOV circle (D2D / GDI+ antialiased)
             if (fovFilter) {
                 int fovR = (int)g_fovRadiusF;
-                if (g_gfx) {
+                if (g_d2d) {
+                    g_d2d->EllipseOutlineDashed((float)cx, (float)cy, (float)fovR, (float)fovR, g_fovCircleColor, 1.0f, 0.55f);
+                }
+                else if (g_gfx) {
                     Gdiplus::Pen fp(GdipCol(g_fovCircleColor, 140), 1.0f);
                     fp.SetDashStyle(Gdiplus::DashStyleDot);
                     g_gfx->DrawEllipse(&fp, cx - fovR, cy - fovR, fovR * 2, fovR * 2);
                 }
                 else {
-                    HPEN fovPen = CreatePen(PS_DOT, 1, g_fovCircleColor);
-                    SelectObject(mem, fovPen); SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    Ellipse(mem, cx - fovR, cy - fovR, cx + fovR, cy + fovR);
-                    DeleteObject(fovPen);
+                    EspEllipseOutline(mem, cx - fovR, cy - fovR, cx + fovR, cy + fovR, g_fovCircleColor);
                 }
             }
 
-            // Aim FOV circle + target line (GDI+ antialiased)
+            // Aim FOV circle + target line
             if (g_silentAim.load()) {
-                if (g_gfx) {
-                    Gdiplus::Pen ap(GdipCol(RGB(255, 40, 40), 180), 1.0f);
-                    g_gfx->DrawEllipse(&ap, cx - aimFovI, cy - aimFovI, aimFovI * 2, aimFovI * 2);
+                if (g_d2d) {
+                    g_d2d->EllipseOutline((float)cx, (float)cy, (float)aimFovI, (float)aimFovI, RGB(255, 40, 40), 1.0f, 0.7f);
                 }
                 else {
-                    HPEN aimPen = CreatePen(PS_SOLID, 1, RGB(255, 40, 40));
-                    SelectObject(mem, aimPen); SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    Ellipse(mem, cx - aimFovI, cy - aimFovI, cx + aimFovI, cy + aimFovI);
-                    DeleteObject(aimPen);
+                    EspEllipseOutline(mem, cx - aimFovI, cy - aimFovI, cx + aimFovI, cy + aimFovI, RGB(255, 40, 40));
                 }
                 if (hasAimTarget) {
                     int atx, aty;
                     if (W2S(aimTarget, atx, aty, frame, SW, SH)) {
-                        HPEN tline = CreatePen(PS_SOLID, 1, RGB(255, 60, 60));
-                        SelectObject(mem, tline); MoveToEx(mem, cx, cy, NULL); LineTo(mem, atx, aty); DeleteObject(tline);
-                        HBRUSH tdot = CreateSolidBrush(RGB(255, 40, 40));
-                        SelectObject(mem, tdot); Ellipse(mem, atx - 4, aty - 4, atx + 4, aty + 4); DeleteObject(tdot);
+                        EspLine(mem, cx, cy, atx, aty, RGB(255, 60, 60));
+                        EspEllipse(mem, atx - 4, aty - 4, atx + 4, aty + 4, RGB(255, 40, 40));
                     }
                 }
             }
             if (g_mouseAim.load() || g_railgunAim.load()) {
-                HPEN maimPen = CreatePen(PS_SOLID, 1, RGB(40, 255, 40));
-                SelectObject(mem, maimPen); SelectObject(mem, GetStockObject(NULL_BRUSH));
-                Ellipse(mem, cx - aimFovI, cy - aimFovI, cx + aimFovI, cy + aimFovI);
-                DeleteObject(maimPen);
+                if (g_d2d) {
+                    g_d2d->EllipseOutline((float)cx, (float)cy, (float)aimFovI, (float)aimFovI, RGB(40, 255, 40), 1.0f, 0.7f);
+                }
+                else {
+                    EspEllipseOutline(mem, cx - aimFovI, cy - aimFovI, cx + aimFovI, cy + aimFovI, RGB(40, 255, 40));
+                }
                 if (hasAimTarget) {
                     int atx, aty;
                     if (W2S(aimTarget, atx, aty, frame, SW, SH)) {
-                        HPEN tline = CreatePen(PS_SOLID, 1, RGB(40, 255, 40));
-                        SelectObject(mem, tline); MoveToEx(mem, cx, cy, NULL); LineTo(mem, atx, aty); DeleteObject(tline);
-                        HBRUSH tdot = CreateSolidBrush(RGB(40, 255, 40));
-                        SelectObject(mem, tdot); Ellipse(mem, atx - 4, aty - 4, atx + 4, aty + 4); DeleteObject(tdot);
+                        EspLine(mem, cx, cy, atx, aty, RGB(40, 255, 40));
+                        EspEllipse(mem, atx - 4, aty - 4, atx + 4, aty + 4, RGB(40, 255, 40));
                     }
                 }
             }
@@ -2848,17 +2970,15 @@ void RunOverlays(int dayzid) {
                 int rpx, rpy;
                 if (W2S(g_raidPoint, rpx, rpy, frame, SW, SH)) {
                     // Diamond crosshair — orange
-                    HPEN rp = CreatePen(PS_SOLID, 2, RGB(255, 140, 40));
-                    SelectObject(mem, rp);
-                    // Diamond
-                    MoveToEx(mem, rpx, rpy - 10, NULL); LineTo(mem, rpx + 10, rpy);
-                    LineTo(mem, rpx, rpy + 10); LineTo(mem, rpx - 10, rpy); LineTo(mem, rpx, rpy - 10);
-                    // Crosshair lines extending from diamond
-                    MoveToEx(mem, rpx, rpy - 16, NULL); LineTo(mem, rpx, rpy - 10);
-                    MoveToEx(mem, rpx, rpy + 10, NULL); LineTo(mem, rpx, rpy + 16);
-                    MoveToEx(mem, rpx - 16, rpy, NULL); LineTo(mem, rpx - 10, rpy);
-                    MoveToEx(mem, rpx + 10, rpy, NULL); LineTo(mem, rpx + 16, rpy);
-                    DeleteObject(rp);
+                    EspLine(mem, rpx, rpy - 10, rpx + 10, rpy, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx + 10, rpy, rpx, rpy + 10, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx, rpy + 10, rpx - 10, rpy, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx - 10, rpy, rpx, rpy - 10, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx, rpy - 16, rpx, rpy - 10, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx, rpy + 10, rpx, rpy + 16, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx - 16, rpy, rpx - 10, rpy, RGB(255, 140, 40), 2.0f);
+                    EspLine(mem, rpx + 10, rpy, rpx + 16, rpy, RGB(255, 140, 40), 2.0f);
+                    if (g_d2d) g_d2d->RadialGlow((float)rpx, (float)rpy, 14.0f, RGB(255, 140, 40), 0.15f);
                     // Distance + active loops text
                     float rdx = g_raidPoint.x - frame.camPos.x;
                     float rdy = g_raidPoint.y - frame.camPos.y;
@@ -2873,10 +2993,10 @@ void RunOverlays(int dayzid) {
                     else {
                         snprintf(raidTxt, sizeof(raidTxt), "RAID %.0fm", rdist);
                     }
-                    SelectObject(mem, espFItemDist);
-                    SetTextColor(mem, RGB(255, 160, 60));
-                    SIZE rts; GetTextExtentPoint32A(mem, raidTxt, (int)strlen(raidTxt), &rts);
-                    TextOutA(mem, rpx - rts.cx / 2, rpy + 18, raidTxt, (int)strlen(raidTxt));
+                    EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontItemDist.Get() : nullptr);
+                    EspSetColor(mem, RGB(255, 160, 60));
+                    SIZE rts; EspMeasure(mem, raidTxt, (int)strlen(raidTxt), &rts);
+                    EspTextOut(mem, rpx - rts.cx / 2, rpy + 18, raidTxt, (int)strlen(raidTxt));
                 }
             }
 
@@ -2885,19 +3005,13 @@ void RunOverlays(int dayzid) {
                 int mtx, mty;
                 if (W2S(g_mortarTarget, mtx, mty, frame, SW, SH)) {
                     // Crosshair reticle — cyan/teal
-                    HPEN mp = CreatePen(PS_SOLID, 2, RGB(0, 220, 220));
-                    SelectObject(mem, mp);
-                    SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    Ellipse(mem, mtx - 12, mty - 12, mtx + 12, mty + 12);
-                    MoveToEx(mem, mtx, mty - 18, NULL); LineTo(mem, mtx, mty - 6);
-                    MoveToEx(mem, mtx, mty + 6, NULL); LineTo(mem, mtx, mty + 18);
-                    MoveToEx(mem, mtx - 18, mty, NULL); LineTo(mem, mtx - 6, mty);
-                    MoveToEx(mem, mtx + 6, mty, NULL); LineTo(mem, mtx + 18, mty);
-                    HBRUSH md = CreateSolidBrush(RGB(0, 255, 255));
-                    SelectObject(mem, md);
-                    Ellipse(mem, mtx - 2, mty - 2, mtx + 3, mty + 3);
-                    DeleteObject(md);
-                    DeleteObject(mp);
+                    EspEllipseOutline(mem, mtx - 12, mty - 12, mtx + 12, mty + 12, RGB(0, 220, 220), 2);
+                    EspLine(mem, mtx, mty - 18, mtx, mty - 6, RGB(0, 220, 220), 2.0f);
+                    EspLine(mem, mtx, mty + 6, mtx, mty + 18, RGB(0, 220, 220), 2.0f);
+                    EspLine(mem, mtx - 18, mty, mtx - 6, mty, RGB(0, 220, 220), 2.0f);
+                    EspLine(mem, mtx + 6, mty, mtx + 18, mty, RGB(0, 220, 220), 2.0f);
+                    EspEllipse(mem, mtx - 2, mty - 2, mtx + 3, mty + 3, RGB(0, 255, 255));
+                    if (g_d2d) g_d2d->RadialGlow((float)mtx, (float)mty, 16.0f, RGB(0, 220, 220), 0.12f);
                     // Distance + label
                     float mdx = g_mortarTarget.x - frame.camPos.x;
                     float mdy = g_mortarTarget.y - frame.camPos.y;
@@ -2906,16 +3020,12 @@ void RunOverlays(int dayzid) {
                     char mortarTxt[96];
                     snprintf(mortarTxt, sizeof(mortarTxt), "(TARGET) %.0fm  [%.0f, %.0f, %.0f]",
                         mdist, g_mortarTarget.x, g_mortarTarget.y, g_mortarTarget.z);
-                    SelectObject(mem, espFItemDist);
-                    SIZE mts; GetTextExtentPoint32A(mem, mortarTxt, (int)strlen(mortarTxt), &mts);
+                    EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontItemDist.Get() : nullptr);
+                    SIZE mts; EspMeasure(mem, mortarTxt, (int)strlen(mortarTxt), &mts);
                     int mLblX = mtx - mts.cx / 2 - 6, mLblY = mty + 20;
-                    HBRUSH mBg = CreateSolidBrush(RGB(8, 20, 20));
-                    HPEN mBgP = CreatePen(PS_SOLID, 1, RGB(0, 80, 80));
-                    SelectObject(mem, mBg); SelectObject(mem, mBgP);
-                    RoundRect(mem, mLblX, mLblY, mLblX + mts.cx + 12, mLblY + mts.cy + 4, 6, 6);
-                    DeleteObject(mBg); DeleteObject(mBgP);
-                    SetTextColor(mem, RGB(0, 220, 220));
-                    TextOutA(mem, mtx - mts.cx / 2, mLblY + 2, mortarTxt, (int)strlen(mortarTxt));
+                    EspRoundRect(mem, mLblX, mLblY, mLblX + mts.cx + 12, mLblY + mts.cy + 4, 6, 6, RGB(8, 20, 20), RGB(0, 80, 80));
+                    EspSetColor(mem, RGB(0, 220, 220));
+                    EspTextOut(mem, mtx - mts.cx / 2, mLblY + 2, mortarTxt, (int)strlen(mortarTxt));
                 }
             }
 
@@ -2954,85 +3064,75 @@ void RunOverlays(int dayzid) {
                     int bW2 = (std::min)(bH2, (std::max)(dW, 6));
                     int ecx = (int)sx2;
 
-                    // Corner box (GDI+ antialiased)
+                    // Corner box (D2D / GDI+ antialiased)
                     int left = ecx - bW2 / 2, right = ecx + bW2 / 2, top = syH, bot = syF;
                     int cLen = (std::max)(4, (std::min)(bH2 / 4, bW2 / 3));
-                    if (g_gfx) {
-                        Gdiplus::Pen bp(GdipCol(boxCol), 2.0f);
-                        bp.SetStartCap(Gdiplus::LineCapRound);
-                        bp.SetEndCap(Gdiplus::LineCapRound);
-                        // Top-left
-                        g_gfx->DrawLine(&bp, left, top + cLen, left, top); g_gfx->DrawLine(&bp, left, top, left + cLen, top);
-                        // Top-right
-                        g_gfx->DrawLine(&bp, right - cLen, top, right, top); g_gfx->DrawLine(&bp, right, top, right, top + cLen);
-                        // Bottom-left
-                        g_gfx->DrawLine(&bp, left, bot - cLen, left, bot); g_gfx->DrawLine(&bp, left, bot, left + cLen, bot);
-                        // Bottom-right
-                        g_gfx->DrawLine(&bp, right - cLen, bot, right, bot); g_gfx->DrawLine(&bp, right, bot, right, bot - cLen);
+                    if (g_d2d) {
+                        // Subtle glow behind box for players
+                        if (ent.isPlayer) g_d2d->Glow((float)left, (float)top, (float)(right - left), (float)(bot - top), 2.0f, boxCol, 4, 0.08f);
+                        // Corner brackets with rounded caps
+                        g_d2d->LineRound((float)left, (float)(top + cLen), (float)left, (float)top, boxCol, 2.0f);
+                        g_d2d->LineRound((float)left, (float)top, (float)(left + cLen), (float)top, boxCol, 2.0f);
+                        g_d2d->LineRound((float)(right - cLen), (float)top, (float)right, (float)top, boxCol, 2.0f);
+                        g_d2d->LineRound((float)right, (float)top, (float)right, (float)(top + cLen), boxCol, 2.0f);
+                        g_d2d->LineRound((float)left, (float)(bot - cLen), (float)left, (float)bot, boxCol, 2.0f);
+                        g_d2d->LineRound((float)left, (float)bot, (float)(left + cLen), (float)bot, boxCol, 2.0f);
+                        g_d2d->LineRound((float)(right - cLen), (float)bot, (float)right, (float)bot, boxCol, 2.0f);
+                        g_d2d->LineRound((float)right, (float)bot, (float)right, (float)(bot - cLen), boxCol, 2.0f);
                         // Snapline
                         bool wantSnap = ent.isPlayer ? g_snapPlayers.load() : g_snapZombies.load();
-                        if (wantSnap) {
-                            Gdiplus::Pen sp2(GdipCol(snapCol, 180), 1.0f);
-                            g_gfx->DrawLine(&sp2, SW / 2, SH - 1, ecx, syF);
-                        }
+                        if (wantSnap) g_d2d->Line((float)(SW / 2), (float)(SH - 1), (float)ecx, (float)syF, snapCol, 1.0f, 0.7f);
+                    }
+                    else if (g_gfx) {
+                        Gdiplus::Pen bp(GdipCol(boxCol), 2.0f);
+                        bp.SetStartCap(Gdiplus::LineCapRound); bp.SetEndCap(Gdiplus::LineCapRound);
+                        g_gfx->DrawLine(&bp, left, top + cLen, left, top); g_gfx->DrawLine(&bp, left, top, left + cLen, top);
+                        g_gfx->DrawLine(&bp, right - cLen, top, right, top); g_gfx->DrawLine(&bp, right, top, right, top + cLen);
+                        g_gfx->DrawLine(&bp, left, bot - cLen, left, bot); g_gfx->DrawLine(&bp, left, bot, left + cLen, bot);
+                        g_gfx->DrawLine(&bp, right - cLen, bot, right, bot); g_gfx->DrawLine(&bp, right, bot, right, bot - cLen);
+                        bool wantSnap = ent.isPlayer ? g_snapPlayers.load() : g_snapZombies.load();
+                        if (wantSnap) { Gdiplus::Pen sp2(GdipCol(snapCol, 180), 1.0f); g_gfx->DrawLine(&sp2, SW / 2, SH - 1, ecx, syF); }
                     }
                     else {
-                        HPEN pen = CreatePen(PS_SOLID, 2, boxCol);
-                        SelectObject(mem, pen);
-                        MoveToEx(mem, left, top + cLen, NULL); LineTo(mem, left, top); LineTo(mem, left + cLen, top);
-                        MoveToEx(mem, right - cLen, top, NULL); LineTo(mem, right, top); LineTo(mem, right, top + cLen);
-                        MoveToEx(mem, left, bot - cLen, NULL); LineTo(mem, left, bot); LineTo(mem, left + cLen, bot);
-                        MoveToEx(mem, right - cLen, bot, NULL); LineTo(mem, right, bot); LineTo(mem, right, bot - cLen);
-                        DeleteObject(pen);
-                        bool wantSnap2 = ent.isPlayer ? g_snapPlayers.load() : g_snapZombies.load();
-                        if (wantSnap2) {
-                            HPEN sp = CreatePen(PS_SOLID, 1, snapCol);
-                            SelectObject(mem, sp); MoveToEx(mem, SW / 2, SH - 1, NULL); LineTo(mem, ecx, syF); DeleteObject(sp);
-                        }
+                        EspLine(mem, left, top + cLen, left, top, boxCol, 2.0f);
+                        EspLine(mem, left, top, left + cLen, top, boxCol, 2.0f);
+                        EspLine(mem, right - cLen, top, right, top, boxCol, 2.0f);
+                        EspLine(mem, right, top, right, top + cLen, boxCol, 2.0f);
+                        EspLine(mem, left, bot - cLen, left, bot, boxCol, 2.0f);
+                        EspLine(mem, left, bot, left + cLen, bot, boxCol, 2.0f);
+                        EspLine(mem, right - cLen, bot, right, bot, boxCol, 2.0f);
+                        EspLine(mem, right, bot, right, bot - cLen, boxCol, 2.0f);
+                        bool wantSnap = ent.isPlayer ? g_snapPlayers.load() : g_snapZombies.load();
+                        if (wantSnap) EspLine(mem, SW / 2, SH - 1, ecx, syF, snapCol);
                     }
 
                     // Distance tag with dark rounded background
-                    SelectObject(mem, espFItemDist);
+                    EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontItemDist.Get() : nullptr);
                     char dt[32]; sprintf_s(dt, "%.0fm", ent.dist);
-                    SIZE ts; GetTextExtentPoint32A(mem, dt, (int)strlen(dt), &ts);
+                    SIZE ts; EspMeasure(mem, dt, (int)strlen(dt), &ts);
                     int tagX = ecx - ts.cx / 2 - 4, tagY = syF + 3;
-                    if (g_gfx) {
-                        GdipRoundRect(tagX, tagY, ts.cx + 8, ts.cy + 2, 3, RGB(8, 10, 14), RGB(30, 32, 42), 1);
-                    }
-                    else {
-                        HBRUSH dtBg = CreateSolidBrush(RGB(12, 14, 18));
-                        RECT dtR = { tagX, tagY, tagX + ts.cx + 8, tagY + ts.cy + 2 };
-                        FillRect(mem, &dtR, dtBg); DeleteObject(dtBg);
-                    }
-                    SetTextColor(mem, RGB(200, 210, 220));
-                    TextOutA(mem, ecx - ts.cx / 2, tagY + 1, dt, (int)strlen(dt));
+                    GdipRoundRect(tagX, tagY, ts.cx + 8, ts.cy + 2, 3, RGB(8, 10, 14), RGB(30, 32, 42), 1);
+                    EspSetColor(mem, RGB(200, 210, 220));
+                    EspTextOut(mem, ecx - ts.cx / 2, tagY + 1, dt, (int)strlen(dt));
 
                     // Weapon in hand (players only)
                     if (ent.isPlayer && !ent.weaponName.empty()) {
                         const char* wn = ent.weaponName.c_str();
-                        SIZE ws; GetTextExtentPoint32A(mem, wn, (int)ent.weaponName.length(), &ws);
+                        SIZE ws; EspMeasure(mem, wn, (int)ent.weaponName.length(), &ws);
                         int wTagX = ecx - ws.cx / 2 - 4, wTagY = tagY + ts.cy + 4;
-                        if (g_gfx) {
-                            GdipRoundRect(wTagX, wTagY, ws.cx + 8, ws.cy + 2, 3, RGB(8, 10, 14), RGB(40, 30, 20), 1);
-                        }
-                        else {
-                            HBRUSH wBg = CreateSolidBrush(RGB(12, 14, 18));
-                            RECT wR = { wTagX, wTagY, wTagX + ws.cx + 8, wTagY + ws.cy + 2 };
-                            FillRect(mem, &wR, wBg); DeleteObject(wBg);
-                        }
-                        SetTextColor(mem, RGB(255, 160, 80));
-                        TextOutA(mem, ecx - ws.cx / 2, wTagY + 1, wn, (int)ent.weaponName.length());
+                        GdipRoundRect(wTagX, wTagY, ws.cx + 8, ws.cy + 2, 3, RGB(8, 10, 14), RGB(40, 30, 20), 1);
+                        EspSetColor(mem, RGB(255, 160, 80));
+                        EspTextOut(mem, ecx - ws.cx / 2, wTagY + 1, wn, (int)ent.weaponName.length());
                     }
 
                     // ── Player inventory list (toggled via g_showPlayerInv) ──
                     if (ent.isPlayer && g_showPlayerInv.load() && !ent.inventory.empty() && ent.dist < 200.f) {
-                        SelectObject(mem, espFItemDist);
+                        EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontItemDist.Get() : nullptr);
                         int invStartY = syF + ts.cy + 4;
                         if (!ent.weaponName.empty()) invStartY += ts.cy + 6;
                         int maxW = 0;
-                        // Measure max width first
                         for (auto& invItem : ent.inventory) {
-                            SIZE is; GetTextExtentPoint32A(mem, invItem.c_str(), (int)invItem.length(), &is);
+                            SIZE is; EspMeasure(mem, invItem.c_str(), (int)invItem.length(), &is);
                             if (is.cx > maxW) maxW = is.cx;
                         }
                         int invPad = 5, lineH = 13;
@@ -3040,68 +3140,51 @@ void RunOverlays(int dayzid) {
                         int invBoxH = (int)ent.inventory.size() * lineH + invPad * 2;
                         int invBoxX = ecx - invBoxW / 2;
                         // Semi-transparent inventory panel
-                        if (g_gfx) {
-                            Gdiplus::SolidBrush ibg(GdipCol(RGB(8, 8, 14), 160));
-                            Gdiplus::Pen ibp(GdipCol(RGB(60, 55, 80), 120), 1.0f);
-                            Gdiplus::GraphicsPath ip;
-                            ip.AddArc(invBoxX, invStartY, 6, 6, 180, 90);
-                            ip.AddArc(invBoxX + invBoxW - 6, invStartY, 6, 6, 270, 90);
-                            ip.AddArc(invBoxX + invBoxW - 6, invStartY + invBoxH - 6, 6, 6, 0, 90);
-                            ip.AddArc(invBoxX, invStartY + invBoxH - 6, 6, 6, 90, 90);
-                            ip.CloseFigure();
-                            g_gfx->FillPath(&ibg, &ip);
-                            g_gfx->DrawPath(&ibp, &ip);
-                        }
-                        else {
-                            HBRUSH ibg2 = CreateSolidBrush(RGB(8, 8, 14));
-                            RECT ir2 = { invBoxX, invStartY, invBoxX + invBoxW, invStartY + invBoxH };
-                            FillRect(mem, &ir2, ibg2); DeleteObject(ibg2);
-                        }
+                        GdipRoundRect(invBoxX, invStartY, invBoxW, invBoxH, 3, RGB(8, 8, 14), RGB(60, 55, 80), 1);
                         // Render each item
                         int iy = invStartY + invPad;
                         for (auto& invItem : ent.inventory) {
-                            // Color by category
                             int ic = CategorizeItem(invItem);
                             COLORREF icc = g_catColors[ic >= 0 && ic < CAT_COUNT ? ic : CAT_OTHER];
                             int ir = (GetRValue(icc) * 2 + 180) / 3;
                             int ig = (GetGValue(icc) * 2 + 180) / 3;
-                            int ib = (GetBValue(icc) * 2 + 180) / 3;
-                            SetTextColor(mem, RGB(ir > 255 ? 255 : ir, ig > 255 ? 255 : ig, ib > 255 ? 255 : ib));
-                            TextOutA(mem, invBoxX + invPad + 4, iy, invItem.c_str(), (int)invItem.length());
+                            int ib2 = (GetBValue(icc) * 2 + 180) / 3;
+                            EspSetColor(mem, RGB(ir > 255 ? 255 : ir, ig > 255 ? 255 : ig, ib2 > 255 ? 255 : ib2));
+                            EspTextOut(mem, invBoxX + invPad + 4, iy, invItem.c_str(), (int)invItem.length());
                             iy += lineH;
                         }
                     }
 
                     if (ent.isZombie) {
-                        SelectObject(mem, espF);
-                        SetTextColor(mem, g_colPlayerBox);
-                        TextOutA(mem, ecx - 12, syH - 14, "Zmb", 3);
+                        EspSelectFont(mem, espF, d2dReady ? g_espOverlay.fontESP.Get() : nullptr);
+                        EspSetColor(mem, g_colPlayerBox);
+                        EspTextOut(mem, ecx - 12, syH - 14, "Zmb", 3);
                     }
 
                     // Tagged target indicator
                     if ((ent.isPlayer || ent.isZombie) && ent.ptr == g_taggedTarget) {
-                        // Pulsing red circle around box
                         int pulse = (tick % T_1S < T_HALF_S) ? 255 : 180;
-                        HPEN tagPen = CreatePen(PS_SOLID, 2, RGB(pulse, 20, 20));
-                        SelectObject(mem, tagPen); SelectObject(mem, GetStockObject(NULL_BRUSH));
                         int pad = 6;
-                        Ellipse(mem, left - pad, top - pad, right + pad, bot + pad);
-                        DeleteObject(tagPen);
-                        // TAG label above head
-                        SelectObject(mem, espFItem);
-                        SetTextColor(mem, RGB(255, 40, 40));
-                        SIZE tagSz; GetTextExtentPoint32A(mem, "TAGGED", 6, &tagSz);
-                        // Dark background for label
-                        HBRUSH tagBg = CreateSolidBrush(RGB(40, 8, 8));
-                        RECT tagR = { ecx - tagSz.cx / 2 - 4, syH - 28, ecx + tagSz.cx / 2 + 4, syH - 28 + tagSz.cy + 2 };
-                        FillRect(mem, &tagR, tagBg); DeleteObject(tagBg);
-                        TextOutA(mem, ecx - tagSz.cx / 2, syH - 28, "TAGGED", 6);
+                        float tagCx = (left + right) / 2.0f, tagCy = (top + bot) / 2.0f;
+                        float tagRx = (right - left) / 2.0f + (float)pad, tagRy = (bot - top) / 2.0f + (float)pad;
+                        if (g_d2d) {
+                            g_d2d->EllipseOutline(tagCx, tagCy, tagRx, tagRy, RGB(pulse, 20, 20), 2.0f);
+                            g_d2d->RadialGlow(tagCx, tagCy, tagRx + 4.0f, RGB(255, 20, 20), 0.1f);
+                        }
+                        else {
+                            EspEllipseOutline(mem, left - pad, top - pad, right + pad, bot + pad, RGB(pulse, 20, 20), 2);
+                        }
+                        EspSelectFont(mem, espFItem, d2dReady ? g_espOverlay.fontItem.Get() : nullptr);
+                        EspSetColor(mem, RGB(255, 40, 40));
+                        SIZE tagSz; EspMeasure(mem, "TAGGED", 6, &tagSz);
+                        EspFillRect(mem, ecx - tagSz.cx / 2 - 4, syH - 28, ecx + tagSz.cx / 2 + 4, syH - 28 + tagSz.cy + 2, RGB(40, 8, 8));
+                        EspTextOut(mem, ecx - tagSz.cx / 2, syH - 28, "TAGGED", 6);
                     }
 
-                    SelectObject(mem, espF); SetTextColor(mem, g_colPlayerBox);
+                    EspSelectFont(mem, espF, d2dReady ? g_espOverlay.fontESP.Get() : nullptr);
+                    EspSetColor(mem, g_colPlayerBox);
 
                     if (((ent.isPlayer && g_showBones.load()) || (ent.isZombie && g_showZombieBones.load())) && ent.hasBones && ent.dist <= g_skeleDist) {
-                        HPEN bp2 = CreatePen(PS_SOLID, 1, g_colBone); SelectObject(mem, bp2);
                         for (int li = 0; li < NUM_BONE_LINKS; li++) {
                             auto& lk = g_boneLinks[li];
                             if (!ent.bones[lk.from].valid || !ent.bones[lk.to].valid)continue;
@@ -3109,95 +3192,71 @@ void RunOverlays(int dayzid) {
                             if (W2S(ent.bones[lk.from].pos, x1, y1, frame, SW, SH) &&
                                 W2S(ent.bones[lk.to].pos, x2, y2, frame, SW, SH))
                             {
-                                MoveToEx(mem, x1, y1, NULL); LineTo(mem, x2, y2);
+                                EspLine(mem, x1, y1, x2, y2, g_colBone);
                             }
                         }
-                        DeleteObject(bp2);
                         if (ent.bones[PB_HEAD].valid) {
                             int hx, hy;
                             if (W2S(ent.bones[PB_HEAD].pos, hx, hy, frame, SW, SH)) {
-                                HBRUSH hb = CreateSolidBrush(g_colHeadDot);
-                                SelectObject(mem, hb); Ellipse(mem, hx - 3, hy - 3, hx + 3, hy + 3); DeleteObject(hb);
+                                EspEllipse(mem, hx - 3, hy - 3, hx + 3, hy + 3, g_colHeadDot);
                             }
                         }
                     }
                 }
                 else if (ent.isItem) {
-                    int ecx = sxF, ecy = syF;
+                    int ecx2 = sxF, ecy = syF;
 
-                    // Get category color (custom per-type)
                     int ci = ent.catIdx;
                     if (ci < 0 || ci >= CAT_COUNT) ci = CAT_OTHER;
                     COLORREF catCol = g_catColors[ci];
 
-                    // Measure item name and distance separately
-                    SelectObject(mem, espFItem);
+                    EspSelectFont(mem, espFItem, d2dReady ? g_espOverlay.fontItem.Get() : nullptr);
                     const char* iname = ent.name.c_str();
                     int nameLen = (int)ent.name.length();
-                    SIZE ns; GetTextExtentPoint32A(mem, iname, nameLen, &ns);
+                    SIZE ns; EspMeasure(mem, iname, nameLen, &ns);
 
-                    SelectObject(mem, espFItemDist);
+                    EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontItemDist.Get() : nullptr);
                     char distBuf[24]; snprintf(distBuf, sizeof(distBuf), "%.0fm", ent.dist);
                     int distLen = (int)strlen(distBuf);
-                    SIZE ds; GetTextExtentPoint32A(mem, distBuf, distLen, &ds);
+                    SIZE ds; EspMeasure(mem, distBuf, distLen, &ds);
 
-                    // Total tag dimensions: name + gap + distance
                     int gap = 6;
                     int totalW = ns.cx + gap + ds.cx;
                     int tagH = ns.cy + 2;
                     int padX = 7, padY = 3;
-                    int tagX = ecx - totalW / 2 - padX;
+                    int tagX = ecx2 - totalW / 2 - padX;
                     int tagY = ecy - tagH / 2 - padY - 2;
                     int tagW = totalW + padX * 2;
                     int tagHFull = tagH + padY * 2;
 
-                    // Semi-transparent background with category-tinted border (GDI+)
-                    if (g_gfx) {
-                        // Alpha-blended dark pill — 70% opacity so stacked items are readable
-                        Gdiplus::SolidBrush abg(GdipCol(RGB(10, 12, 16), 180));
-                        Gdiplus::GraphicsPath tp;
-                        tp.AddArc(tagX, tagY, 6, 6, 180, 90);
-                        tp.AddArc(tagX + tagW - 6, tagY, 6, 6, 270, 90);
-                        tp.AddArc(tagX + tagW - 6, tagY + tagHFull - 6, 6, 6, 0, 90);
-                        tp.AddArc(tagX, tagY + tagHFull - 6, 6, 6, 90, 90);
-                        tp.CloseFigure();
-                        g_gfx->FillPath(&abg, &tp);
-                        // Category-colored left accent strip
-                        Gdiplus::SolidBrush acb(GdipCol(catCol, 200));
-                        g_gfx->FillRectangle(&acb, tagX + 1, tagY + 3, 2, tagHFull - 6);
-                        // Subtle border
-                        Gdiplus::Pen bp(GdipCol(catCol, 60), 1.0f);
-                        g_gfx->DrawPath(&bp, &tp);
+                    // Semi-transparent background with accent
+                    if (g_d2d) {
+                        g_d2d->FillRoundRect((float)tagX, (float)tagY, (float)tagW, (float)tagHFull, 3.0f, RGB(10, 12, 16), 0.7f);
+                        g_d2d->FillRect((float)(tagX + 1), (float)(tagY + 3), 2.0f, (float)(tagHFull - 6), catCol, 0.78f);
+                        g_d2d->DrawRoundRect((float)tagX, (float)tagY, (float)tagW, (float)tagHFull, 3.0f, catCol, 1.0f, 0.24f);
                     }
                     else {
-                        HBRUSH bgBr = CreateSolidBrush(RGB(12, 14, 18));
-                        HPEN bgPen = CreatePen(PS_SOLID, 1, RGB(40, 44, 52));
-                        SelectObject(mem, bgBr); SelectObject(mem, bgPen);
-                        RoundRect(mem, tagX, tagY, tagX + tagW, tagY + tagHFull, 6, 6);
-                        DeleteObject(bgBr); DeleteObject(bgPen);
+                        GdipRoundRect(tagX, tagY, tagW, tagHFull, 3, RGB(10, 12, 16), catCol, 1);
                     }
 
-                    // Item name — tinted by category color
-                    int textX = ecx - totalW / 2;
+                    int textX = ecx2 - totalW / 2;
                     int textY = tagY + padY;
-                    SelectObject(mem, espFItem);
-                    // Blend category color toward white for readability
+                    EspSelectFont(mem, espFItem, d2dReady ? g_espOverlay.fontItem.Get() : nullptr);
                     int nr = (GetRValue(catCol) + 255) / 2;
                     int ng = (GetGValue(catCol) + 255) / 2;
                     int nb = (GetBValue(catCol) + 255) / 2;
-                    SetTextColor(mem, RGB(nr, ng, nb));
-                    TextOutA(mem, textX, textY, iname, nameLen);
+                    EspSetColor(mem, RGB(nr, ng, nb));
+                    EspTextOut(mem, textX, textY, iname, nameLen);
 
-                    // Distance — dimmer
-                    SelectObject(mem, espFItemDist);
-                    SetTextColor(mem, RGB(130, 140, 155));
-                    TextOutA(mem, textX + ns.cx + gap, textY + (ns.cy - ds.cy), distBuf, distLen);
+                    EspSelectFont(mem, espFItemDist, d2dReady ? g_espOverlay.fontItemDist.Get() : nullptr);
+                    EspSetColor(mem, RGB(130, 140, 155));
+                    EspTextOut(mem, textX + ns.cx + gap, textY + (ns.cy - ds.cy), distBuf, distLen);
                 }
             }
 
             // Well ESP
             if (g_showWells.load()) {
-                SelectObject(mem, espF);
+                EspSelectFont(mem, espF, d2dReady ? g_espOverlay.fontESP.Get() : nullptr);
                 for (int wi = 0; wi < NUM_WELLS; wi++) {
                     vector3 wpos = { g_wells[wi].x,frame.camPos.y,g_wells[wi].z };
                     float wdx = wpos.x - frame.camPos.x, wdz = wpos.z - frame.camPos.z;
@@ -3205,26 +3264,32 @@ void RunOverlays(int dayzid) {
                     if (wdist < 5.f || wdist>1500.f)continue;
                     int wsx, wsy;
                     if (!W2S(wpos, wsx, wsy, frame, SW, SH))continue;
-                    HPEN wp = CreatePen(PS_SOLID, 1, COL_WELL); SelectObject(mem, wp);
                     int ix = wsx, iy2 = wsy - 10;
-                    MoveToEx(mem, ix - 5, iy2 + 4, NULL); LineTo(mem, ix - 4, iy2 + 12);
-                    LineTo(mem, ix + 4, iy2 + 12); LineTo(mem, ix + 5, iy2 + 4);
-                    MoveToEx(mem, ix - 5, iy2 + 4, NULL); LineTo(mem, ix + 5, iy2 + 4);
-                    MoveToEx(mem, ix - 3, iy2 + 4, NULL); LineTo(mem, ix, iy2); LineTo(mem, ix + 3, iy2 + 4);
-                    MoveToEx(mem, ix - 3, iy2 + 8, NULL); LineTo(mem, ix - 1, iy2 + 7); LineTo(mem, ix + 1, iy2 + 9); LineTo(mem, ix + 3, iy2 + 8);
-                    DeleteObject(wp);
+                    // Well icon lines
+                    EspLine(mem, ix - 5, iy2 + 4, ix - 4, iy2 + 12, COL_WELL);
+                    EspLine(mem, ix - 4, iy2 + 12, ix + 4, iy2 + 12, COL_WELL);
+                    EspLine(mem, ix + 4, iy2 + 12, ix + 5, iy2 + 4, COL_WELL);
+                    EspLine(mem, ix - 5, iy2 + 4, ix + 5, iy2 + 4, COL_WELL);
+                    EspLine(mem, ix - 3, iy2 + 4, ix, iy2, COL_WELL);
+                    EspLine(mem, ix, iy2, ix + 3, iy2 + 4, COL_WELL);
+                    EspLine(mem, ix - 3, iy2 + 8, ix - 1, iy2 + 7, COL_WELL);
+                    EspLine(mem, ix - 1, iy2 + 7, ix + 1, iy2 + 9, COL_WELL);
+                    EspLine(mem, ix + 1, iy2 + 9, ix + 3, iy2 + 8, COL_WELL);
                     char wl[48]; snprintf(wl, sizeof(wl), "Well  %.0fm", wdist);
-                    SIZE ws; GetTextExtentPoint32A(mem, wl, (int)strlen(wl), &ws);
-                    SetTextColor(mem, RGB(0, 0, 0)); TextOutA(mem, ix - ws.cx / 2 + 1, iy2 + 14, wl, (int)strlen(wl));
-                    SetTextColor(mem, COL_WELL); TextOutA(mem, ix - ws.cx / 2, iy2 + 13, wl, (int)strlen(wl));
+                    int wlLen = (int)strlen(wl);
+                    SIZE ws; EspMeasure(mem, wl, wlLen, &ws);
+                    EspSetColor(mem, RGB(0, 0, 0));
+                    EspTextOut(mem, ix - ws.cx / 2 + 1, iy2 + 14, wl, wlLen);
+                    EspSetColor(mem, COL_WELL);
+                    EspTextOut(mem, ix - ws.cx / 2, iy2 + 13, wl, wlLen);
                 }
-                SetTextColor(mem, g_colPlayerBox);
+                EspSetColor(mem, g_colPlayerBox);
             }
 
             // Landmark ESP
             if (g_showLandmarks.load()) {
                 bool wantCities = g_lmCities.load(), wantTowns = g_lmTowns.load(), wantMili = g_lmMilitary.load();
-                SelectObject(mem, espFL);
+                EspSelectFont(mem, espFL, d2dReady ? g_espOverlay.fontLandmark.Get() : nullptr);
                 for (int li = 0; li < NUM_LANDMARKS; li++) {
                     auto& lm = g_landmarks[li];
                     if (lm.cat == LM_CITY && !wantCities)continue;
@@ -3243,34 +3308,38 @@ void RunOverlays(int dayzid) {
                     else if (lm.cat == LM_CITY)lcol = RGB(200, 180, 255);
                     else lcol = RGB(160, 200, 160);
                     char lb[64]; snprintf(lb, sizeof(lb), "%s [%.0fm]", lm.name, ldist);
-                    SIZE ls; GetTextExtentPoint32A(mem, lb, (int)strlen(lb), &ls);
-                    SetTextColor(mem, RGB(0, 0, 0)); TextOutA(mem, lsx - ls.cx / 2 + 1, lsy + 1, lb, (int)strlen(lb));
-                    SetTextColor(mem, lcol); TextOutA(mem, lsx - ls.cx / 2, lsy, lb, (int)strlen(lb));
+                    int lbLen = (int)strlen(lb);
+                    SIZE ls; EspMeasure(mem, lb, lbLen, &ls);
+                    EspSetColor(mem, RGB(0, 0, 0));
+                    EspTextOut(mem, lsx - ls.cx / 2 + 1, lsy + 1, lb, lbLen);
+                    EspSetColor(mem, lcol);
+                    EspTextOut(mem, lsx - ls.cx / 2, lsy, lb, lbLen);
                 }
-                SelectObject(mem, espF); SetTextColor(mem, g_colPlayerBox);
+                EspSelectFont(mem, espF, d2dReady ? g_espOverlay.fontESP.Get() : nullptr);
+                EspSetColor(mem, g_colPlayerBox);
             }
 
             // ── Waypoint ESP ──
             if (!g_waypoints.empty()) {
-                SelectObject(mem, espFL);
+                EspSelectFont(mem, espFL, d2dReady ? g_espOverlay.fontLandmark.Get() : nullptr);
                 for (size_t wi = 0; wi < g_waypoints.size(); wi++) {
-                    auto& wp = g_waypoints[wi];
-                    vector3 wpPos = { wp.x, wp.y, wp.z };
+                    auto& wp2 = g_waypoints[wi];
+                    vector3 wpPos = { wp2.x, wp2.y, wp2.z };
                     int wsx, wsy;
                     if (!W2S(wpPos, wsx, wsy, frame, SW, SH)) continue;
-                    float wdx = wp.x - frame.camPos.x, wdz = wp.z - frame.camPos.z;
+                    float wdx = wp2.x - frame.camPos.x, wdz = wp2.z - frame.camPos.z;
                     float wdist = sqrtf(wdx * wdx + wdz * wdz);
-                    HPEN wpPen = CreatePen(PS_SOLID, 2, RGB(0, 170, 255));
-                    SelectObject(mem, wpPen); SelectObject(mem, GetStockObject(NULL_BRUSH));
+                    COLORREF wpCol = RGB(0, 170, 255);
                     POINT diamond[4] = { {wsx, wsy - 6},{wsx + 5, wsy},{wsx, wsy + 6},{wsx - 5, wsy} };
-                    Polygon(mem, diamond, 4);
-                    DeleteObject(wpPen);
-                    char wpLbl[48]; snprintf(wpLbl, sizeof(wpLbl), "%s [%.0fm]", wp.name, wdist);
-                    SetTextColor(mem, RGB(0, 170, 255));
-                    SIZE ws; GetTextExtentPoint32A(mem, wpLbl, (int)strlen(wpLbl), &ws);
-                    TextOutA(mem, wsx - ws.cx / 2, wsy + 8, wpLbl, (int)strlen(wpLbl));
+                    EspPolygon(mem, diamond, 4, 0, wpCol, 2);
+                    char wpLbl[48]; snprintf(wpLbl, sizeof(wpLbl), "%s [%.0fm]", wp2.name, wdist);
+                    int wpLen = (int)strlen(wpLbl);
+                    EspSetColor(mem, wpCol);
+                    SIZE ws; EspMeasure(mem, wpLbl, wpLen, &ws);
+                    EspTextOut(mem, wsx - ws.cx / 2, wsy + 8, wpLbl, wpLen);
                 }
-                SelectObject(mem, espF); SetTextColor(mem, g_colPlayerBox);
+                EspSelectFont(mem, espF, d2dReady ? g_espOverlay.fontESP.Get() : nullptr);
+                EspSetColor(mem, g_colPlayerBox);
             }
 
             // ── Out-of-view player arrows (uses ESP-collected screen data) ──
@@ -3280,10 +3349,7 @@ void RunOverlays(int dayzid) {
                 if (!aimActive) arrowRad = 120;
 
                 if (!aimActive) {
-                    HPEN indPen = CreatePen(PS_SOLID, 1, RGB(50, 55, 70));
-                    SelectObject(mem, indPen); SelectObject(mem, GetStockObject(NULL_BRUSH));
-                    Ellipse(mem, cx - arrowRad, cy - arrowRad, cx + arrowRad, cy + arrowRad);
-                    DeleteObject(indPen);
+                    EspEllipseOutline(mem, cx - arrowRad, cy - arrowRad, cx + arrowRad, cy + arrowRad, RGB(50, 55, 70), 1);
                 }
 
                 for (size_t ai = 0; ai < arrowPlayers.size(); ai++) {
@@ -3312,19 +3378,21 @@ void RunOverlays(int dayzid) {
                     int bright = 255 - (int)(ad2.dist * 0.3f);
                     if (bright < 80) bright = 80;
                     if (bright > 255) bright = 255;
-                    HBRUSH arBr = CreateSolidBrush(RGB(bright, (int)(bright * 0.35f), (int)(bright * 0.35f)));
-                    HPEN arPen = CreatePen(PS_SOLID, 1, RGB(bright, (int)(bright * 0.35f), (int)(bright * 0.35f)));
-                    SelectObject(mem, arBr); SelectObject(mem, arPen);
-                    Polygon(mem, tri, 3);
-                    DeleteObject(arBr); DeleteObject(arPen);
+                    COLORREF arCol = RGB(bright, (int)(bright * 0.35f), (int)(bright * 0.35f));
+                    EspPolygon(mem, tri, 3, arCol, arCol, 1);
                 }
             }
 
-            // ── Cleanup ESP GDI+ ──
-            g_gfx = nullptr;
-
-            BitBlt(hdc, 0, 0, SW, SH, mem, 0, 0, SRCCOPY);
-            DeleteObject(bmp); DeleteDC(mem); ReleaseDC(espH, hdc);
+            // ── Cleanup ESP frame ──
+            if (d2dReady) {
+                g_d2d = nullptr;
+                g_espOverlay.EndFrame();
+            }
+            else {
+                g_gfx = nullptr;
+                BitBlt(hdc, 0, 0, SW, SH, mem, 0, 0, SRCCOPY);
+                DeleteObject(bmp); DeleteDC(mem); ReleaseDC(espH, hdc);
+            }
         }
 
         // ══════════════════════════════
@@ -3626,6 +3694,7 @@ void StartOverlayThread(int d) {
 
 void StopAll() {
     g_shutdownAll = true; Sleep(300);
+    g_espOverlay.Shutdown();
     RestoreBrightness(); g_brightness = 1.0f;
     g_espEnabled = false; g_radarEnabled = false; g_showBones = false; g_showZombieBones = false; g_showItems = false;
     g_snapPlayers = true; g_snapZombies = false; g_skeleDist = 200.f; g_maxZombieRender = 30.f;
@@ -4680,7 +4749,7 @@ static int DrawConfigPage(HDC dc, int scrollY) {
         Stat stats[8];
         snprintf(stats[0].v, 32, "v1.28.8"); stats[0].l = "VERSION"; stats[0].c = C_ACCENT;
         snprintf(stats[1].v, 32, "Active"); stats[1].l = "DRIVER"; stats[1].c = C_GREEN;
-        snprintf(stats[2].v, 32, "GDI"); stats[2].l = "OVERLAY"; stats[2].c = RGB(0, 170, 255);
+        snprintf(stats[2].v, 32, g_espOverlay.initialized ? "D2D" : "GDI"); stats[2].l = "OVERLAY"; stats[2].c = g_espOverlay.initialized ? RGB(0, 200, 120) : RGB(0, 170, 255);
         snprintf(stats[3].v, 32, "~500"); stats[3].l = "FPS"; stats[3].c = RGB(245, 190, 50);
         snprintf(stats[4].v, 32, "--"); stats[4].l = "ENTITIES"; stats[4].c = RGB(0, 170, 255);
         snprintf(stats[5].v, 32, "--"); stats[5].l = "ITEMS"; stats[5].c = RGB(245, 190, 50);
