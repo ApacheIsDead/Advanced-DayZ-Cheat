@@ -56,6 +56,10 @@ public:
     // ── Reusable brush ──
     ComPtr<ID2D1SolidColorBrush> brush;
 
+    // ── Cached stroke styles (avoid per-frame COM object creation) ──
+    ComPtr<ID2D1StrokeStyle> styleRoundCap;
+    ComPtr<ID2D1StrokeStyle> styleDashed;
+
     bool initialized = false;
 
     // ════════════════════════════════════════
@@ -117,7 +121,7 @@ public:
         scd.SampleDesc.Count = 1;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         scd.BufferCount = 2;
-        scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
         ComPtr<IDXGIFactory2> dxgiFactory;
@@ -133,10 +137,21 @@ public:
 
         // 8. Antialiasing settings
         dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+        // MUST use grayscale — ClearType requires opaque background and hangs on premultiplied alpha surfaces
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
         // 9. Reusable brush
         dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &brush);
+
+        // 9b. Cache stroke styles (creating these per-frame causes GPU driver stalls)
+        D2D1_STROKE_STYLE_PROPERTIES sspRound = {};
+        sspRound.startCap = D2D1_CAP_STYLE_ROUND;
+        sspRound.endCap = D2D1_CAP_STYLE_ROUND;
+        d2dFactory->CreateStrokeStyle(sspRound, nullptr, 0, &styleRoundCap);
+
+        D2D1_STROKE_STYLE_PROPERTIES sspDash = {};
+        sspDash.dashStyle = D2D1_DASH_STYLE_DASH;
+        d2dFactory->CreateStrokeStyle(sspDash, nullptr, 0, &styleDashed);
 
         // 10. DirectComposition for transparent overlay
         hr = DCompositionCreateDevice(dxgiDevice.Get(),
@@ -223,12 +238,7 @@ public:
 
     void LineRound(float x1, float y1, float x2, float y2, COLORREF c, float w = 1.0f, float a = 1.0f) {
         SetBrush(c, a);
-        ComPtr<ID2D1StrokeStyle> style;
-        D2D1_STROKE_STYLE_PROPERTIES ssp = {};
-        ssp.startCap = D2D1_CAP_STYLE_ROUND;
-        ssp.endCap = D2D1_CAP_STYLE_ROUND;
-        d2dFactory->CreateStrokeStyle(ssp, nullptr, 0, &style);
-        dc->DrawLine({ x1, y1 }, { x2, y2 }, brush.Get(), w, style.Get());
+        dc->DrawLine({ x1, y1 }, { x2, y2 }, brush.Get(), w, styleRoundCap.Get());
     }
 
     // ── Rectangles ──
@@ -320,11 +330,7 @@ public:
 
     void EllipseOutlineDashed(float cx, float cy, float rx, float ry, COLORREF c, float sw = 1.0f, float a = 1.0f) {
         SetBrush(c, a);
-        D2D1_STROKE_STYLE_PROPERTIES ssp = {};
-        ssp.dashStyle = D2D1_DASH_STYLE_DASH;
-        ComPtr<ID2D1StrokeStyle> style;
-        d2dFactory->CreateStrokeStyle(ssp, nullptr, 0, &style);
-        dc->DrawEllipse(D2D1::Ellipse({ cx, cy }, rx, ry), brush.Get(), sw, style.Get());
+        dc->DrawEllipse(D2D1::Ellipse({ cx, cy }, rx, ry), brush.Get(), sw, styleDashed.Get());
     }
 
     // ── Pill (capsule shape) ──
