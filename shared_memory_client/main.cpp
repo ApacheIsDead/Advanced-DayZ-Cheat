@@ -624,7 +624,7 @@ static std::unordered_map<uintptr_t, std::pair<int, std::vector<std::string>>> g
 
 // Tick rate constants — overlay runs at Sleep(2) ≈ ~500fps
 // Use these for all time-based logic so timers don't break if Sleep changes
-static constexpr int TPS = 500;              // approximate ticks per second
+static constexpr int TPS = 60;               // approximate ticks per second (~60fps overlay)
 static constexpr int T_HALF_S = TPS / 2;     // 250  — 0.5s
 static constexpr int T_1S = TPS;             // 500  — 1s
 static constexpr int T_2S = TPS * 2;         // 1000 — 2s
@@ -1364,7 +1364,7 @@ static FrameData ReadGameFrame(int dayzid, int screenW, int screenH, int tick) {
 
     // ── PHASE 9b: Player inventory (cached, refresh every ~4s) ──
     if (g_showPlayerInv.load()) {
-        static constexpr int INV_REFRESH = 120; // ~4s at 30fps read rate
+        static constexpr int INV_REFRESH = T_3S; // refresh every ~3s
         for (auto& ed : f.entities) {
             if (!ed.isPlayer || ed.dist >= 300.f) continue;
             ed.catIdx = -1; // players don't have item category
@@ -1748,23 +1748,21 @@ static void GdipGradientRoundRect(int x, int y, int w, int h, int r, COLORREF to
     }
 }
 
-// Glow effect: multiple expanded rounded rects with decreasing alpha
+// Glow effect: single expanded rounded rect (lightweight — avoids multi-pass path draws)
 static void GdipGlow(int x, int y, int w, int h, int r, COLORREF color, int spread = 6, BYTE peakAlpha = 30) {
     if (g_d2d) { g_d2d->Glow((float)x, (float)y, (float)w, (float)h, (float)r, color, spread, peakAlpha / 255.0f); return; }
     if (!g_gfx) return;
-    for (int i = spread; i > 0; i--) {
-        BYTE a = (BYTE)(peakAlpha * (spread - i + 1) / spread);
-        Gdiplus::GraphicsPath path;
-        int d2 = (r + i) * 2;
-        int ex = x - i, ey = y - i, ew = w + i * 2, eh = h + i * 2;
-        path.AddArc(ex, ey, d2, d2, 180, 90);
-        path.AddArc(ex + ew - d2, ey, d2, d2, 270, 90);
-        path.AddArc(ex + ew - d2, ey + eh - d2, d2, d2, 0, 90);
-        path.AddArc(ex, ey + eh - d2, d2, d2, 90, 90);
-        path.CloseFigure();
-        Gdiplus::Pen gp(GdipCol(color, a), 1.0f);
-        g_gfx->DrawPath(&gp, &path);
-    }
+    // Single outer glow ring instead of multi-pass to prevent GDI+ stalls
+    Gdiplus::GraphicsPath path;
+    int d2 = (r + spread) * 2;
+    int ex = x - spread, ey = y - spread, ew = w + spread * 2, eh = h + spread * 2;
+    path.AddArc(ex, ey, d2, d2, 180, 90);
+    path.AddArc(ex + ew - d2, ey, d2, d2, 270, 90);
+    path.AddArc(ex + ew - d2, ey + eh - d2, d2, d2, 0, 90);
+    path.AddArc(ex, ey + eh - d2, d2, d2, 90, 90);
+    path.CloseFigure();
+    Gdiplus::Pen gp(GdipCol(color, (BYTE)(peakAlpha * 2 / 3)), 2.0f);
+    g_gfx->DrawPath(&gp, &path);
 }
 
 // Antialiased filled pill (capsule)
@@ -1816,15 +1814,12 @@ static void GdipGradientV(int x, int y, int w, int h, COLORREF top, COLORREF bot
     g_gfx->FillRectangle(&gb, x, y, w, h);
 }
 
-// Radial glow at a point (for logo, LEDs, active indicators)
+// Radial glow at a point (single translucent circle — avoids concentric draw stalls)
 static void GdipRadialGlow(int cx, int cy, int r, COLORREF color, BYTE peakAlpha = 50) {
     if (g_d2d) { g_d2d->RadialGlow((float)cx, (float)cy, (float)r, color, peakAlpha / 255.0f); return; }
     if (!g_gfx) return;
-    for (int i = r; i > 0; i -= 2) {
-        BYTE a = (BYTE)(peakAlpha * i / r);
-        Gdiplus::SolidBrush fb(GdipCol(color, a));
-        g_gfx->FillEllipse(&fb, cx - i, cy - i, i * 2, i * 2);
-    }
+    Gdiplus::SolidBrush fb(GdipCol(color, (BYTE)(peakAlpha / 2)));
+    g_gfx->FillEllipse(&fb, cx - r, cy - r, r * 2, r * 2);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2651,7 +2646,7 @@ void RunOverlays(int dayzid) {
             }
             // Expire tracers not seen for 60 ticks (~1s)
             for (int t = g_tracerCount - 1; t >= 0; t--) {
-                if (tick - g_tracers[t].lastSeen > 60) {
+                if (tick - g_tracers[t].lastSeen > T_1S) { // expire after ~1s
                     g_tracers[t] = g_tracers[--g_tracerCount];
                 }
             }
@@ -2900,7 +2895,7 @@ void RunOverlays(int dayzid) {
                     if (!v2) { x2t = (std::max)(0, (std::min)(SW, x2t)); y2t = (std::max)(0, (std::min)(SH, y2t)); }
                     // Fade based on age
                     int age = tick - g_tracers[t].lastSeen;
-                    BYTE alpha = (BYTE)(std::max)(40, 220 - age * 4);
+                    BYTE alpha = (BYTE)(std::max)(40, 220 - age * 255 / T_1S);
                     float alphaF = alpha / 255.0f;
                     if (g_d2d) {
                         g_d2d->Line((float)x1t, (float)y1t, (float)x2t, (float)y2t, g_tracerColor, 1.5f, alphaF);
@@ -3401,7 +3396,7 @@ void RunOverlays(int dayzid) {
         // ══════════════════════════════
         //  RENDER RADAR (circular)
         // ══════════════════════════════
-        if (radOn && (tick % 30 == 0)) {
+        if (radOn && (tick % 4 == 0)) { // ~15fps radar updates
             HDC hdc = GetDC(radH);
             if (hdc) {
                 HDC mem = CreateCompatibleDC(hdc);
@@ -3623,7 +3618,7 @@ void RunOverlays(int dayzid) {
         }
 
         drainWrites(1); // process at most 1 queued speed write per frame
-        tick++; Sleep(2); // ~500fps with batch reads
+        tick++; Sleep(16); // ~60fps — prevents GPU queue saturation and DWM stalls
     }
 
     DeleteObject(espF); DeleteObject(espFL); DeleteObject(espFItem); DeleteObject(espFItemDist); DeleteObject(radF);
@@ -3773,6 +3768,7 @@ static bool g_menuDrag = false;
 static POINT g_dragStart = {};
 static int g_dayzid_menu = 0;
 static int g_scrollY = 0;          // page scroll offset
+static std::atomic<bool> g_menuDirty{ true }; // only repaint when state changes
 static int g_contentH = 600;       // total content height (computed per page)
 static int g_sidebarHover = -1;
 
@@ -4997,7 +4993,7 @@ static LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     switch (msg) {
     case WM_CREATE: RegisterHotKey(hwnd, 100, 0, VK_F1); return 0;
     case WM_HOTKEY:
-        if (wParam == 100) { g_menuVisible = !g_menuVisible; ShowWindow(hwnd, g_menuVisible ? SW_SHOW : SW_HIDE); }
+        if (wParam == 100) { g_menuVisible = !g_menuVisible; ShowWindow(hwnd, g_menuVisible ? SW_SHOW : SW_HIDE); g_menuDirty = true; }
         return 0;
 
     case WM_LBUTTONDOWN: {
@@ -5210,8 +5206,9 @@ static LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     case WM_TIMER: {
-        if (wParam == 200 && g_menuPage == 3)
-            InvalidateRect(hwnd, nullptr, FALSE);
+        if (wParam == 200 && g_menuPage == 3) {
+            g_menuDirty = true;
+        }
         return 0;
     }
     case WM_CHAR: {
@@ -5494,7 +5491,9 @@ void ShowMenu(int dayzid) {
         }
         CheckPendingWaypoint();
         CheckPendingMortar();
-        if (g_menuHwnd && g_menuVisible) InvalidateRect(g_menuHwnd, nullptr, FALSE);
+        // Only repaint when state actually changed (dirty flag set by input handlers)
+        if (g_menuHwnd && g_menuVisible && g_menuDirty.exchange(false))
+            InvalidateRect(g_menuHwnd, nullptr, FALSE);
         Sleep(33);
     }
 ex: StopAll();
