@@ -121,7 +121,7 @@ public:
         scd.SampleDesc.Count = 1;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         scd.BufferCount = 2;
-        scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
         ComPtr<IDXGIFactory2> dxgiFactory;
@@ -132,10 +132,7 @@ public:
         hr = dxgiFactory->CreateSwapChainForComposition(d3dDevice.Get(), &scd, nullptr, &swapChain);
         if (FAILED(hr)) return false;
 
-        // 7. Create D2D bitmap target from swap chain back buffer
-        if (!CreateTargetBitmap()) return false;
-
-        // 8. Antialiasing settings
+        // 7. Antialiasing settings (target bitmap is created per-frame for FLIP swap chains)
         dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         // MUST use grayscale — ClearType requires opaque background and hangs on premultiplied alpha surfaces
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
@@ -193,6 +190,9 @@ public:
 
     bool BeginFrame() {
         if (!initialized) return false;
+        // FLIP swap chains require re-acquiring the back buffer each frame.
+        // Holding a stale reference across Present() deadlocks the swap chain.
+        if (!AcquireBackBuffer()) return false;
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0)); // fully transparent
         return true;
@@ -200,11 +200,10 @@ public:
 
     void EndFrame() {
         HRESULT hr = dc->EndDraw();
-        if (hr == D2DERR_RECREATE_TARGET) {
-            // Device lost — recreate
-            CreateTargetBitmap();
-            return;
-        }
+        // Release back buffer reference BEFORE Present — required for FLIP swap chains
+        dc->SetTarget(nullptr);
+        targetBitmap.Reset();
+        if (hr == D2DERR_RECREATE_TARGET) return;
         DXGI_PRESENT_PARAMETERS pp = {};
         swapChain->Present1(0, 0, &pp);
     }
@@ -477,7 +476,9 @@ public:
     }
 
 private:
-    bool CreateTargetBitmap() {
+    // Acquire the current back buffer from the swap chain and bind it as D2D render target.
+    // Must be called every frame — FLIP swap chains invalidate back buffer references after Present().
+    bool AcquireBackBuffer() {
         ComPtr<IDXGISurface> dxgiSurface;
         HRESULT hr = swapChain->GetBuffer(0, __uuidof(IDXGISurface), (void**)&dxgiSurface);
         if (FAILED(hr)) return false;
@@ -489,6 +490,7 @@ private:
         bmpProps.dpiY = 96.0f;
         bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
+        targetBitmap.Reset();
         hr = dc->CreateBitmapFromDxgiSurface(dxgiSurface.Get(), bmpProps, &targetBitmap);
         if (FAILED(hr)) return false;
 

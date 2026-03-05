@@ -2822,7 +2822,10 @@ void RunOverlays(int dayzid) {
         // ══════════════════════════════
         //  RENDER ESP (Direct2D or GDI+ fallback)
         // ══════════════════════════════
-        if (espOn) {
+        // D2D frame pacing: render ESP at ~60fps (every 8 ticks at Sleep(2) ≈ 500fps loop)
+        // to avoid starving the game's GPU with overlay presents
+        bool d2dSkipFrame = d2dReady && (tick % 8 != 0);
+        if (espOn && !d2dSkipFrame) {
             // ── Frame setup: D2D path or GDI fallback ──
             HDC hdc = nullptr, mem = nullptr;
             HBITMAP bmp = nullptr;
