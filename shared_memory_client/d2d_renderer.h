@@ -193,6 +193,10 @@ public:
 
     bool BeginFrame() {
         if (!initialized) return false;
+        // With FLIP_DISCARD swap chains, buffers rotate after Present.
+        // Must re-acquire the back buffer each frame or D2D draws to
+        // the front buffer that DWM is compositing, causing a deadlock.
+        if (!CreateTargetBitmap()) return false;
         dc->BeginDraw();
         dc->Clear(D2D1::ColorF(0, 0, 0, 0)); // fully transparent
         return true;
@@ -201,12 +205,16 @@ public:
     void EndFrame() {
         HRESULT hr = dc->EndDraw();
         if (hr == D2DERR_RECREATE_TARGET) {
-            // Device lost — recreate
             CreateTargetBitmap();
             return;
         }
+        // Release D2D's reference to the back buffer BEFORE presenting.
+        // Holding it during Present blocks DWM composition (screen freeze).
+        dc->SetTarget(nullptr);
+        targetBitmap.Reset();
+
         DXGI_PRESENT_PARAMETERS pp = {};
-        swapChain->Present1(1, 0, &pp); // vsync — prevents GPU queue saturation
+        swapChain->Present1(0, 0, &pp); // no vsync — DComposition handles its own composition timing
     }
 
     // ════════════════════════════════════════
