@@ -1994,9 +1994,12 @@ void RunOverlays(int dayzid) {
             if (fabsf(b - lastBright) > 0.01f) { ApplyBrightness(b); lastBright = b; }
         }
 
-        ShowWindow(espH, espOn ? SW_SHOWNOACTIVATE : SW_HIDE);
-        ShowWindow(radH, radOn ? SW_SHOWNOACTIVATE : SW_HIDE);
-        ShowWindow(barH, radOn ? SW_SHOWNOACTIVATE : SW_HIDE);
+        // Only call ShowWindow when state changes (calling every frame can stall DWM with D2D/DComp)
+        {
+            static bool lastEsp = false, lastRad = false;
+            if (espOn != lastEsp) { ShowWindow(espH, espOn ? SW_SHOWNOACTIVATE : SW_HIDE); lastEsp = espOn; }
+            if (radOn != lastRad) { ShowWindow(radH, radOn ? SW_SHOWNOACTIVATE : SW_HIDE); ShowWindow(barH, radOn ? SW_SHOWNOACTIVATE : SW_HIDE); lastRad = radOn; }
+        }
         if (!espOn && !radOn && !aimOn && !g_mouseAim.load() && !g_railgunAim.load() && !g_laserFire.load() && !g_raidMode.load() && !g_noRecoil.load() && !g_mortarMode.load() && !g_bulletTracers.load() && !g_lootTP.load() && !g_remoteLoot.load() && !g_freecam.load() && !g_noGrass.load() && !g_noGrassApplied) { drainWrites(1); Sleep(50); tick++; continue; }
 
         FrameData rawFrame = ReadGameFrame(dayzid, SW, SH, tick);
