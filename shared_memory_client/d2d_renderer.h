@@ -206,7 +206,7 @@ public:
             return;
         }
         DXGI_PRESENT_PARAMETERS pp = {};
-        swapChain->Present1(0, 0, &pp);
+        swapChain->Present1(1, 0, &pp); // vsync — prevents GPU queue saturation
     }
 
     // ════════════════════════════════════════
@@ -273,23 +273,19 @@ public:
         }
     }
 
-    // ── Gradient Rounded Rectangle ──
+    // ── Gradient Rounded Rectangle (approximated with solid fill to avoid COM alloc) ──
     void GradientRoundRect(float x, float y, float w, float h, float r,
         COLORREF top, COLORREF bot, COLORREF stroke = 0, float sw = 0,
         float topA = 1.0f, float botA = 1.0f)
     {
         auto rr = D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), r, r);
-
-        D2D1_GRADIENT_STOP stops[2];
-        stops[0] = { 0.0f, Col(top, topA) };
-        stops[1] = { 1.0f, Col(bot, botA) };
-        ComPtr<ID2D1GradientStopCollection> sc;
-        dc->CreateGradientStopCollection(stops, 2, &sc);
-        ComPtr<ID2D1LinearGradientBrush> gb;
-        dc->CreateLinearGradientBrush(
-            D2D1::LinearGradientBrushProperties({ x, y }, { x, y + h }),
-            sc.Get(), &gb);
-        dc->FillRoundedRectangle(rr, gb.Get());
+        // Use averaged color instead of per-call gradient COM objects
+        int mr = (GetRValue(top) + GetRValue(bot)) / 2;
+        int mg = (GetGValue(top) + GetGValue(bot)) / 2;
+        int mb = (GetBValue(top) + GetBValue(bot)) / 2;
+        float ma = (topA + botA) / 2.0f;
+        SetBrush(RGB(mr, mg, mb), ma);
+        dc->FillRoundedRectangle(rr, brush.Get());
 
         if (sw > 0 && stroke) {
             SetBrush(stroke);
@@ -340,48 +336,63 @@ public:
         dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y, x + w, y + h), r, r), brush.Get());
     }
 
-    // ── Glow effect: expanding rounded rects with decreasing alpha ──
+    // ── Glow effect: single expanded rounded rect (lightweight) ──
     void Glow(float x, float y, float w, float h, float r, COLORREF c, int spread = 6, float peakAlpha = 0.12f) {
-        for (int i = spread; i > 0; i--) {
-            float a = peakAlpha * (float)(spread - i + 1) / (float)spread;
-            float ex = x - (float)i, ey = y - (float)i;
-            float ew = w + (float)i * 2, eh = h + (float)i * 2;
-            float er = r + (float)i;
-            SetBrush(c, a);
-            dc->DrawRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(ex, ey, ex + ew, ey + eh), er, er),
-                brush.Get(), 1.0f);
-        }
+        // Single outer glow ring instead of multi-pass — avoids GPU overdraw stalls
+        float ex = x - (float)spread, ey = y - (float)spread;
+        float ew = w + (float)spread * 2, eh = h + (float)spread * 2;
+        float er = r + (float)spread;
+        SetBrush(c, peakAlpha * 0.6f);
+        dc->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(ex, ey, ex + ew, ey + eh), er, er),
+            brush.Get(), 2.0f);
     }
 
-    // ── Radial glow at a point ──
+    // ── Radial glow at a point (single translucent circle) ──
     void RadialGlow(float cx, float cy, float r, COLORREF c, float peakAlpha = 0.2f) {
-        for (float i = r; i > 0; i -= 2.0f) {
-            float a = peakAlpha * i / r;
-            SetBrush(c, a);
-            dc->FillEllipse(D2D1::Ellipse({ cx, cy }, i, i), brush.Get());
-        }
+        // Single filled circle instead of concentric rings — avoids GPU overdraw stalls
+        SetBrush(c, peakAlpha * 0.5f);
+        dc->FillEllipse(D2D1::Ellipse({ cx, cy }, r, r), brush.Get());
     }
 
-    // ── Gradient fills ──
+    // ── Gradient fills (use cached brush, only recreate when colors change) ──
+    ComPtr<ID2D1LinearGradientBrush> cachedGradH;
+    COLORREF cachedGradH_L = 0, cachedGradH_R = 0;
+    ComPtr<ID2D1LinearGradientBrush> cachedGradV;
+    COLORREF cachedGradV_T = 0, cachedGradV_B = 0;
+
     void GradientH(float x, float y, float w, float h, COLORREF left, COLORREF right) {
-        D2D1_GRADIENT_STOP stops[2] = { {0.0f, Col(left)}, {1.0f, Col(right)} };
-        ComPtr<ID2D1GradientStopCollection> sc;
-        dc->CreateGradientStopCollection(stops, 2, &sc);
-        ComPtr<ID2D1LinearGradientBrush> gb;
-        dc->CreateLinearGradientBrush(
-            D2D1::LinearGradientBrushProperties({ x, y }, { x + w, y }), sc.Get(), &gb);
-        dc->FillRectangle(D2D1::RectF(x, y, x + w, y + h), gb.Get());
+        if (!cachedGradH || cachedGradH_L != left || cachedGradH_R != right) {
+            cachedGradH.Reset();
+            D2D1_GRADIENT_STOP stops[2] = { {0.0f, Col(left)}, {1.0f, Col(right)} };
+            ComPtr<ID2D1GradientStopCollection> sc;
+            dc->CreateGradientStopCollection(stops, 2, &sc);
+            dc->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties({ 0, 0 }, { 1, 0 }), sc.Get(), &cachedGradH);
+            cachedGradH_L = left; cachedGradH_R = right;
+        }
+        if (cachedGradH) {
+            cachedGradH->SetStartPoint({ x, y });
+            cachedGradH->SetEndPoint({ x + w, y });
+            dc->FillRectangle(D2D1::RectF(x, y, x + w, y + h), cachedGradH.Get());
+        }
     }
 
     void GradientV(float x, float y, float w, float h, COLORREF top, COLORREF bot) {
-        D2D1_GRADIENT_STOP stops[2] = { {0.0f, Col(top)}, {1.0f, Col(bot)} };
-        ComPtr<ID2D1GradientStopCollection> sc;
-        dc->CreateGradientStopCollection(stops, 2, &sc);
-        ComPtr<ID2D1LinearGradientBrush> gb;
-        dc->CreateLinearGradientBrush(
-            D2D1::LinearGradientBrushProperties({ x, y }, { x, y + h }), sc.Get(), &gb);
-        dc->FillRectangle(D2D1::RectF(x, y, x + w, y + h), gb.Get());
+        if (!cachedGradV || cachedGradV_T != top || cachedGradV_B != bot) {
+            cachedGradV.Reset();
+            D2D1_GRADIENT_STOP stops[2] = { {0.0f, Col(top)}, {1.0f, Col(bot)} };
+            ComPtr<ID2D1GradientStopCollection> sc;
+            dc->CreateGradientStopCollection(stops, 2, &sc);
+            dc->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties({ 0, 0 }, { 0, 1 }), sc.Get(), &cachedGradV);
+            cachedGradV_T = top; cachedGradV_B = bot;
+        }
+        if (cachedGradV) {
+            cachedGradV->SetStartPoint({ x, y });
+            cachedGradV->SetEndPoint({ x, y + h });
+            dc->FillRectangle(D2D1::RectF(x, y, x + w, y + h), cachedGradV.Get());
+        }
     }
 
     // ── Polygon ──
