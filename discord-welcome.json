@@ -1,0 +1,66 @@
+{
+  "content": "# **Welcome to Proxi DayZ** \u2014 The Most Advanced DayZ Cheat\n\nThe future of DayZ domination is here. Undetected. Unstoppable.\n\n\u25b8 Check out the **Feature Showcase** below\n\u25b8 Watch the **YouTube demos** to see it in action\n\u25b8 Join the community and stay updated\n_ _",
+  "embeds": [
+    {
+      "title": "\u2694\ufe0f Combat Features",
+      "description": "Everything you need to dominate every firefight.",
+      "color": 16711680,
+      "fields": [
+        {
+          "name": "\ud83c\udfaf Magic Bullet",
+          "value": "Instant hit registration \u2014 never miss a shot.",
+          "inline": true
+        },
+        {
+          "name": "\ud83d\uddb1\ufe0f Mouse Aimbot",
+          "value": "Smooth, human-like aim assistance.",
+          "inline": true
+        },
+        {
+          "name": "\ud83d\ude82 Railgun",
+          "value": "Devastating long-range precision.",
+          "inline": true
+        },
+        {
+          "name": "\u26a1 SpeedHack",
+          "value": "Move faster than anyone on the server.",
+          "inline": true
+        },
+        {
+          "name": "\ud83c\udf3f NoGrass",
+          "value": "Remove grass for clear visibility.",
+          "inline": true
+        },
+        {
+          "name": "\ud83d\udd2b NoRecoil",
+          "value": "Zero recoil \u2014 full auto laser beam.",
+          "inline": true
+        }
+      ]
+    },
+    {
+      "title": "\ud83d\udc7b Interactable Freecam / Noclip",
+      "description": "Our **#1 signature feature** \u2014 fly anywhere on the map with **full player interaction**.\n\n\u25b8 Shoot targets from any range while in noclip\n\u25b8 Loot bodies and interact with objects remotely\n\u25b8 All existing features stay active while flying\n\u25b8 Fully interactable \u2014 not just a camera, a **weapon**",
+      "color": 10494192,
+      "image": {
+        "url": "https://i.imgur.com/placeholder_freecam.png"
+      }
+    },
+    {
+      "title": "\ud83c\udfa5 Feature Showcase",
+      "description": "See Proxi in action \u2014 real gameplay, real results.\n\n**\u25b6\ufe0f Interactable Noclip, Magic Bullet, Player Teleport & More**\nhttps://youtu.be/fRuq3jVLwiw\n\n**\u25b6\ufe0f DayZ 1.28 Interactable Freecam \u2014 Loot Bodies, Kill Players**\nhttps://www.youtube.com/watch?v=p_f7rhvkyR8",
+      "color": 16744448
+    },
+    {
+      "title": "\ud83d\udee1\ufe0f Why Proxi?",
+      "description": "\u25b8 **Undetected** \u2014 Kernel-level driver, built from scratch\n\u25b8 **Unique Features** \u2014 Interactable freecam exists nowhere else\n\u25b8 **Constant Updates** \u2014 Always up to date with latest DayZ patches\n\u25b8 **Community Driven** \u2014 Features built from user feedback",
+      "color": 5814783,
+      "footer": {
+        "text": "Proxi DayZ \u2014 Built Different"
+      },
+      "timestamp": "2026-02-28T19:28:00.000Z"
+    }
+  ],
+  "username": "Proxi",
+  "attachments": []
+}
