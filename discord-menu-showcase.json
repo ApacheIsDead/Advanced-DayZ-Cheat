@@ -1,0 +1,35 @@
+{
+  "content": "_ _",
+  "embeds": [
+    {
+      "title": "\ud83d\udda5\ufe0f Proxi Menu — Live Preview",
+      "description": "Take a look at the **full in-game menu** running live on DayZ 1.28.\nClean UI. Instant toggles. Zero performance impact.\n_ _",
+      "color": 10494192
+    },
+    {
+      "title": "\u2694\ufe0f Combat Tab",
+      "description": "```\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502  [ON]  Magic Bullet          \u2502\n\u2502  [ON]  Mouse Aimbot          \u2502\n\u2502  [ON]  Railgun               \u2502\n\u2502  [ON]  NoRecoil              \u2502\n\u2502  [  ]  SpeedHack             \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n```\nAll combat features at your fingertips. Toggle on/off instantly mid-game.",
+      "color": 16711680
+    },
+    {
+      "title": "\ud83d\udc7b Freecam / Noclip Tab",
+      "description": "```\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502  [ON]  Interactable Freecam  \u2502\n\u2502  [ON]  Shoot While Flying    \u2502\n\u2502  [ON]  Loot From Distance    \u2502\n\u2502  [ON]  Feature Sync          \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n```\nFly anywhere. Interact with everything. All features stay active as you move.",
+      "color": 10494192
+    },
+    {
+      "title": "\ud83c\udf3f Visuals Tab",
+      "description": "```\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502  [ON]  NoGrass               \u2502\n\u2502  [  ]  ESP (Coming Soon)     \u2502\n\u2502  [  ]  Chams (Coming Soon)   \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n```\nSee everything. Hide nothing. More visuals dropping soon.",
+      "color": 5025616
+    },
+    {
+      "title": "\ud83d\udcf8 Screenshots Above \u2191",
+      "description": "The images above show the **real menu running in-game**.\nNo mockups. No fakes. What you see is what you get.\n\n\u25b8 Clean, minimal overlay\n\u25b8 Hotkey support for every feature\n\u25b8 Runs silently in the background\n\u25b8 Lightweight \u2014 zero FPS drop",
+      "color": 16744448,
+      "footer": {
+        "text": "Proxi DayZ \u2014 The Menu Speaks for Itself"
+      }
+    }
+  ],
+  "username": "Proxi",
+  "attachments": []
+}
